@@ -1,0 +1,25 @@
+{
+  "name": "@phoenix-lens/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsc -p tsconfig.json --watch",
+    "start": "node dist/src/server.js",
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node dist/test/api.test.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ellipsis-labs/phoenix-sdk": "^2.0.3",
+    "@fastify/cors": "latest",
+    "@fastify/websocket": "latest",
+    "@solana/web3.js": "^1.99.0",
+    "fastify": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}
