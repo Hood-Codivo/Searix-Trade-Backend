@@ -7,7 +7,7 @@
     "dev": "tsc -p tsconfig.json --watch",
     "start": "node dist/src/server.js",
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node dist/test/api.test.js",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

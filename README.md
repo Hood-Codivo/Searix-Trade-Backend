@@ -1,17 +1,22 @@
 # Phoenix Lens backend
 
-The backend exposes a stable market-data contract and a WebSocket stream. It currently uses `SimulatedPhoenixProvider` for deterministic local development. A live Phoenix implementation will conform to the same `MarketProvider` interface.
+A Fastify backend exposing a stable market-data and execution-intelligence contract, backed by a `CompositeMarketProvider`:
+
+- **`PhoenixProvider`** — real, live Solana mainnet crypto markets, decoded directly from Phoenix CLOB accounts via `@ellipsis-labs/phoenix-sdk` (no simulation).
+- **`TokenizedStockProvider`** — real tokenized-stock markets (AAPLX/TSLAX/NVDAX, backed by Backed Finance's independently-verified xStocks mints), priced from Jupiter's free public APIs. No market or field in this provider is ever seeded with placeholder data — a market only appears once a real fetch has actually populated it.
+
+Every provider implements the same `MarketProvider` interface (`src/providers/market-provider.ts`), so the app, routes, and tests never need to know which one they're talking to.
 
 ## Run
 
-```powershell
+```bash
 npm install
 npm test
 npm run build
 npm start
 ```
 
-The server listens on `http://localhost:4000` by default.
+The server listens on `http://localhost:4000` by default. See `.env.example` for required configuration (Solana RPC URL, Phoenix market addresses, fee policy, receipts storage path).
 
 ## API
 
@@ -19,80 +24,56 @@ The server listens on `http://localhost:4000` by default.
 - `GET /v1/markets`
 - `GET /v1/markets/:id`
 - `GET /v1/markets/:id/orderbook`
-- `GET /v1/markets/:id/candles`
+- `GET /v1/markets/:id/candles?range=1h|1d|1w|1m`
 - `GET /v1/markets/:id/quality`
+- `POST /v1/markets/:id/execution-quote` — pre-trade fill/impact/fee estimate against the real book, plus a genuine routed comparison quote fetched live from Jupiter's aggregator
+- `POST /v1/markets/:id/execution-receipts` — saves a tamper-evident (SHA-256 content hash), persistent analysis receipt
+- `GET /v1/execution-receipts`
+- `GET /v1/fees/config`
+- `GET /v1/revenue/summary`
+- `GET /v1/alerts` — real peg-deterioration alerts, generated when a tokenized stock's live premium crosses a threshold (150 bps watch / 300 bps warning), persisted, one alert per breach episode
+- `GET /v1/registry` / `GET /v1/registry/:symbol` — verified, sourced issuer/custody/redemption/jurisdiction facts per tokenized-stock asset
 - `WS /v1/stream`
 
-The `meta.simulated` response flag prevents preview data from being mistaken for live trading data.
+The `meta.simulated` flag on `/v1/markets` and the execution-quote response distinguishes markets with a real Phoenix order book from tokenized-stock markets, whose book is a synthetic ladder (AMM tokens have no discrete book to read) generated purely from real price and real Jupiter liquidity — never a fabricated per-symbol template.
 
-Backend — what is finished
+## Backend — what is finished
 
-- Separate Fastify backend application
-- REST API structure
-- WebSocket endpoint
-- Health endpoint
-- Markets endpoint
-- Individual market endpoint
-- Order-book endpoint
-- Candles endpoint
-- Quality-score endpoint
-- Request validation
-- Standard error responses
-- CORS support
-- Simulated updating Phoenix provider
-- Market-provider interface
-- Spread, depth-imbalance and preview quality calculations
-- Four passing API tests
+- Live Phoenix CLOB data: real market discovery, real decoded order books, real ranged candle history, WebSocket account-change subscriptions with a poll backstop
+- Real tokenized-stock markets (AAPLX/TSLAX/NVDAX), independently verified on-chain, priced live from Jupiter (token price, real underlying-equity reference, real 24h volume/change, real liquidity) — zero API key required
+- Pre-trade execution-quote engine: real book-walking math (average fill, price impact, safe size, fees) plus a real Jupiter swap-quote comparison — no fabricated venue multipliers
+- Persistent, tamper-evident execution receipts (`FileReceiptRepository`, SHA-256 content hash), survive a server restart
+- Fee policy, safety-gated (collection requires both an explicit opt-in and a configured treasury address)
+- Peg-deterioration alerts (`PegAlertMonitor`), driven off real premium data as it arrives, persisted (`FileAlertRepository`), one alert per breach episode
+- Verified tokenized-asset registry (issuer, custody, backing, redemption, jurisdiction restrictions, regulatory framework) — every field sourced from the issuer's own documentation, cited, with anything unpublished marked as such rather than invented
+- Full REST + WebSocket surface, request validation, standard error contract, CORS, structured logging
+- Full test suite covering the market, execution-quote, receipt, fee, revenue, alert, and registry contracts
 
-Backend — what is left
+## Backend — what is left
+
 Live market data
 
-- Choose Phoenix Legacy spot or Phoenix perpetuals/Rise
-- Integrate the correct Phoenix SDK
-- Connect Helius or another Solana RPC provider
-- Subscribe to market accounts and transactions
-- Decode real orders and fills
-- Reconstruct live order books
-- Detect missing updates using sequence or slot numbers
-- Recover data after network disconnections
-- Reconcile reconstructed books with RPC snapshots
-
-Data and analytics
-
-- Produce real OHLCV candles
-- Calculate actual 24-hour volume
-- Calculate executable depth
-- Calculate expected slippage for different order sizes
-- Store raw fills and order-book snapshots
-- Add PostgreSQL for application data
-- Add ClickHouse for historical market analytics
-- Add Redis for current market state and caching
-- Implement fairness-pattern analysis
-- Version and audit scoring calculations
-- Add historical backfilling
+- Real Phoenix fill/trade history (current volume figures for Phoenix-native crypto markets come from Jupiter's aggregate cross-DEX stats, not a Phoenix-specific fills feed)
+- Historical backfilling / persisted long-range candle history (currently in-memory, rebuilt on restart)
 
 Trading
 
-- Build Phoenix limit-order instructions
-- Build market-order instructions
-- Simulate transactions
-- Estimate network and priority fees
-- Validate token accounts and balances
-- Track submitted transactions
-- Track partial and complete fills
-- Support order cancellation
-- Verify any referral or revenue-fee mechanism
+- Wallet connection and real transaction construction/signing (MWA/Phantom/Solflare)
+- Track submitted transactions and attach real signatures to receipts (`transactionSignature` is always `null` today — no trade has ever actually executed through this system)
+- Order cancellation, partial-fill tracking
 
 Production infrastructure
 
-- Environment validation
-- Authentication
-- Rate limiting
-- Restricted production CORS
-- Structured logging and monitoring
-- Database migrations
-- Docker deployment
-- CI/CD tests
-- Provider failover
-- Secrets management
-- Security review
+- Authentication, rate limiting, restricted production CORS
+- Database migrations, Docker deployment, CI/CD, provider failover, secrets management, security review
+
+## Roadmap — what would make this defensible, not just a feature
+
+Charts, a swap button, watchlists, AI summaries, and a platform fee are all things a well-resourced competitor (Jupiter, Solflare) could reproduce quickly. These are the areas that are actually hard to copy, roughly ordered by how soon they're achievable:
+
+1. ~~**Peg-deterioration alerts**~~ — **shipped.** `PegAlertMonitor` watches real `premiumBps` as it arrives and raises a persisted alert on threshold crossings (`GET /v1/alerts`), surfaced in the app's Alerts tab.
+2. ~~**Verified tokenized-asset registry**~~ — **shipped.** Sourced issuer/custody/redemption/jurisdiction facts per asset (`GET /v1/registry`), surfaced as a card on each stock market's detail screen.
+3. **Persisted real market-history archive** — today only a 31-day in-memory rolling window survives; persisting real observed spread/premium/depth over time starts a genuine longitudinal dataset before a single trade happens.
+4. **Receipt hash verification endpoint** — let anyone independently confirm a saved receipt's `contentHash` wasn't altered after the fact.
+5. **Real wallet execution + actual-vs-expected tracking** — the biggest lever and the biggest lift. Until real trades exist, the receipt ledger is estimates only; this is what turns it into the proprietary execution-history moat.
+6. **Corporate-action monitoring** (dividends, splits, custodian changes, suspensions) — needs a verified real data source before it can be committed to; not yet researched.

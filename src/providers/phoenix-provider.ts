@@ -1,6 +1,16 @@
 import { Client, type MarketState } from '@ellipsis-labs/phoenix-sdk';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { calculateImbalance, calculateSpreadBps, scoreMarket, type MarketSnapshot, type OrderLevel } from '../domain/market.js';
+import { CandleHistory } from '../domain/candle-history.js';
+import {
+  calculateImbalance,
+  calculateSpreadBps,
+  scoreMarket,
+  summarizeQuality,
+  type CandleRange,
+  type MarketSnapshot,
+  type OrderLevel,
+} from '../domain/market.js';
+import { JupiterReferenceClient } from './jupiter-reference-client.js';
 import type { MarketProvider, MarketUpdate } from './market-provider.js';
 
 // Only the mints we can label with confidence; anything else falls back to a shortened address
@@ -16,12 +26,6 @@ function symbolForMint(mint: PublicKey): string {
   return KNOWN_MINT_SYMBOLS[key] ?? `${key.slice(0, 4)}…${key.slice(-4)}`;
 }
 
-function summarizeQuality(tone: 'clean' | 'watch' | 'caution'): string {
-  if (tone === 'clean') return 'Tight spread and healthy visible depth on both sides of the book.';
-  if (tone === 'watch') return 'Spread and depth are moderate; larger orders may see more slippage.';
-  return 'Wide spread or thin depth on this book may cause higher slippage.';
-}
-
 export type PhoenixProviderConfig = {
   rpcUrl: string;
   wsUrl?: string;
@@ -33,9 +37,13 @@ export class PhoenixProvider implements MarketProvider {
   private readonly connection: Connection;
   private client?: Client;
   private readonly markets = new Map<string, MarketSnapshot>();
+  private readonly candleHistory = new CandleHistory();
   private readonly listeners = new Set<(event: MarketUpdate) => void>();
   private readonly subscriptionIds: number[] = [];
+  private readonly baseMintByAddress = new Map<string, string>();
+  private readonly jupiter = new JupiterReferenceClient();
   private pollTimer?: NodeJS.Timeout;
+  private statsTimer?: NodeJS.Timeout;
   status: 'idle' | 'connected' | 'degraded' = 'idle';
 
   constructor(private readonly config: PhoenixProviderConfig) {
@@ -65,12 +73,17 @@ export class PhoenixProvider implements MarketProvider {
     this.status = 'connected';
     // Backstop in case a websocket update is silently dropped; keeps `status` honest even then.
     this.pollTimer = setInterval(() => this.pollAll(), this.config.pollMs ?? 15_000);
+    // Real 24h change/volume come from a separate, lower-frequency batched Jupiter call (not the
+    // account-change/poll path above, which only ever sees live book state, not historical stats).
+    void this.refreshStats();
+    this.statsTimer = setInterval(() => void this.refreshStats(), 30_000);
   }
 
   async stop() {
     for (const id of this.subscriptionIds) await this.connection.removeAccountChangeListener(id);
     this.subscriptionIds.length = 0;
     if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.statsTimer) clearInterval(this.statsTimer);
     this.status = 'idle';
   }
 
@@ -86,6 +99,30 @@ export class PhoenixProvider implements MarketProvider {
   subscribe(listener: (event: MarketUpdate) => void) {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  getCandles(id: string, range: CandleRange): number[] | undefined {
+    return this.candleHistory.getCandles(id, range);
+  }
+
+  private async refreshStats() {
+    const mints = [...new Set(this.baseMintByAddress.values())];
+    if (mints.length === 0) return;
+    try {
+      const stats = await this.jupiter.fetchStats(mints);
+      for (const [address, mint] of this.baseMintByAddress) {
+        const market = this.markets.get(address);
+        const stat = stats.get(mint);
+        if (!market || !stat) continue;
+        market.change24h = stat.change24h;
+        market.volume24h = stat.volume24h;
+        this.markets.set(address, market);
+        const event: MarketUpdate = { type: 'market.update', market: structuredClone(market) };
+        for (const listener of this.listeners) listener(event);
+      }
+    } catch {
+      // Real-time book data (price/bids/asks) keeps flowing regardless; only 24h stats are stale.
+    }
   }
 
   private async pollAll() {
@@ -117,17 +154,21 @@ export class PhoenixProvider implements MarketProvider {
     const depthUsd = [...bids, ...asks].reduce((sum, level) => sum + level.price * level.size, 0);
     const { score, label, tone } = scoreMarket(spreadBps, depthUsd, imbalance);
 
+    this.candleHistory.record(address, price);
+
     const header = marketState.data.header;
     const base = symbolForMint(header.baseParams.mintKey);
     const quote = symbolForMint(header.quoteParams.mintKey);
+    const baseMint = header.baseParams.mintKey.toBase58();
+    const quoteMint = header.quoteParams.mintKey.toBase58();
+    this.baseMintByAddress.set(address, baseMint);
 
     const previous = this.markets.get(address);
-    // No historical fills/candles feed exists yet (see README), so this is a live-only rolling
-    // window built from observed prices this session, not a true 24h series. change24h is
-    // reported against the first price seen this run for the same reason.
-    const firstPrice = previous?.candles[0] ?? price;
     const candles = previous ? [...previous.candles.slice(-19), price] : [price];
-    const change24h = firstPrice === 0 ? 0 : ((price - firstPrice) / firstPrice) * 100;
+    // change24h/volume24h are real, but come from a separate batched Jupiter call (refreshStats),
+    // not from book updates -- carry forward whatever that last set rather than reset it here.
+    const change24h = previous?.change24h ?? 0;
+    const volume24h = previous?.volume24h ?? 0;
 
     const snapshot: MarketSnapshot = {
       id: address,
@@ -136,7 +177,11 @@ export class PhoenixProvider implements MarketProvider {
       venue: 'Phoenix',
       price,
       change24h,
-      volume24h: 0, // requires a fills/trade-history feed, which is not built yet (README)
+      volume24h,
+      baseMint,
+      quoteMint,
+      baseDecimals: header.baseParams.decimals,
+      quoteDecimals: header.quoteParams.decimals,
       spreadBps,
       depthUsd,
       imbalance,

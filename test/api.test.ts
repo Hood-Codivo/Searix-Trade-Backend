@@ -26,6 +26,12 @@ const fixtures: MarketSnapshot[] = [
     quality: { label: 'Clean fills', tone: 'clean', score: 84, summary: 'Balanced depth, fills near quote.' },
     bids: [{ price: 0.384, size: 28_000 }], asks: [{ price: 0.3844, size: 26_000 }],
     candles: [0.38, 0.383, 0.3842], sequence: 1, observedAt: new Date().toISOString() },
+  { id: 'aaplx-usdc', base: 'AAPLX', quote: 'USDC', venue: 'Phoenix', price: 236.84, change24h: 0.74,
+    volume24h: 2_940_000, spreadBps: 3.8, depthUsd: 418_000, imbalance: 0.54, assetClass: 'tokenized-stock', underlyingSymbol: 'AAPL',
+    reference: { source: 'Jupiter', underlyingFeed: 'AAPL', tokenFeed: 'AAPLx', underlyingPrice: 236.21, tokenPrice: 236.84, premiumBps: 26.7, marketState: 'closed', isLive: false, observedAt: new Date().toISOString() },
+    quality: { label: 'Clean fills', tone: 'clean', score: 88, summary: 'Balanced token depth with a modest premium to the underlying equity reference.' },
+    bids: [{ price: 236.79, size: 74 }, { price: 236.65, size: 138 }], asks: [{ price: 236.89, size: 69 }, { price: 237.04, size: 146 }],
+    candles: [235.9, 236.5, 236.84], sequence: 1, observedAt: new Date().toISOString() },
 ];
 
 // Static, offline fixture provider so the API-contract tests don't depend on live Solana RPC.
@@ -54,7 +60,7 @@ describe('market API', () => {
     const response = await app.inject({ method: 'GET', url: '/v1/markets' });
     const body = response.json();
     assert.equal(response.statusCode, 200);
-    assert.equal(body.data.length, 4);
+    assert.equal(body.data.length, 5);
     assert.equal(body.data[0].venue, 'Phoenix');
     assert.ok(body.data[0].sequence > 0);
   });
@@ -74,5 +80,70 @@ describe('market API', () => {
     const response = await app.inject({ method: 'GET', url: '/v1/markets/missing' });
     assert.equal(response.statusCode, 404);
     assert.equal(response.json().error.code, 'MARKET_NOT_FOUND');
+  });
+
+  it('quotes a buy execution against the book', async () => {
+    const response = await app.inject({ method: 'POST', url: '/v1/markets/sol-usdc/execution-quote', payload: { side: 'buy', amountUsd: 100 } });
+    const body = response.json().data;
+    assert.equal(response.statusCode, 200);
+    assert.equal(body.marketId, 'sol-usdc');
+    assert.ok(body.averagePrice >= body.referencePrice);
+    assert.ok(body.levelsConsumed >= 1);
+    assert.equal(body.feeBreakdown.phoenixFeeBps, 15);
+    assert.equal(body.feeBreakdown.collectionEnabled, false);
+  });
+
+  it('rejects an execution-quote with an invalid amount', async () => {
+    const response = await app.inject({ method: 'POST', url: '/v1/markets/sol-usdc/execution-quote', payload: { side: 'buy', amountUsd: 0 } });
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error.code, 'INVALID_EXECUTION_REQUEST');
+  });
+
+  it('saves and lists an execution receipt with a benchmark price for a tokenized-stock market', async () => {
+    const saveResponse = await app.inject({ method: 'POST', url: '/v1/markets/aaplx-usdc/execution-receipts', payload: { side: 'buy', amountUsd: 5_000 } });
+    const saved = saveResponse.json().data;
+    assert.equal(saveResponse.statusCode, 201);
+    assert.equal(saved.verified, false);
+    assert.equal(saved.symbol, 'AAPLX');
+    assert.ok(saved.benchmarkPrice > 0);
+    assert.ok(typeof saved.contentHash === 'string' && saved.contentHash.length === 64);
+
+    const listResponse = await app.inject({ method: 'GET', url: '/v1/execution-receipts' });
+    const listed = listResponse.json();
+    assert.equal(listResponse.statusCode, 200);
+    assert.equal(listed.data.length, 1);
+    assert.equal(listed.meta.persistence, 'memory');
+  });
+
+  it('reports fee config and a revenue summary derived from saved receipts', async () => {
+    const fees = await app.inject({ method: 'GET', url: '/v1/fees/config' });
+    assert.equal(fees.json().data.collectionEnabled, false);
+
+    const revenue = await app.inject({ method: 'GET', url: '/v1/revenue/summary' });
+    const body = revenue.json().data;
+    assert.equal(body.receiptCount, 1);
+    assert.ok(body.projectedRevenueUsd > 0);
+    assert.equal(body.collectedRevenueUsd, 0);
+  });
+
+  it('lists alerts (none raised, since the fixture provider never emits updates)', async () => {
+    const response = await app.inject({ method: 'GET', url: '/v1/alerts' });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().data, []);
+  });
+
+  it('returns the verified asset registry and a single entry by symbol', async () => {
+    const list = await app.inject({ method: 'GET', url: '/v1/registry' });
+    assert.equal(list.statusCode, 200);
+    assert.ok(list.json().data.length >= 3);
+
+    const entry = await app.inject({ method: 'GET', url: '/v1/registry/AAPLX' });
+    assert.equal(entry.statusCode, 200);
+    assert.equal(entry.json().data.symbol, 'AAPLX');
+    assert.ok(entry.json().data.sources.length > 0);
+
+    const missing = await app.inject({ method: 'GET', url: '/v1/registry/NOTREAL' });
+    assert.equal(missing.statusCode, 404);
+    assert.equal(missing.json().error.code, 'ASSET_NOT_FOUND');
   });
 });
