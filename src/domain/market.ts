@@ -59,6 +59,20 @@ export type MarketSnapshot = {
     isLive: boolean;
     observedAt: string;
   };
+  // Independent second source for the same underlying/token comparison, from Pyth's first-party
+  // feeds (including a redemption-rate feed Pyth publishes directly, rather than us deriving a
+  // premium from two separate prices). Absent/unavailableReason set rather than fabricated when
+  // the feed grant doesn't cover these feeds yet -- see providers/pyth-client.ts.
+  pyth?: {
+    source: 'Pyth';
+    equityPrice: number | null;
+    tokenPrice: number | null;
+    redemptionRate: number | null;
+    premiumBps: number | null;
+    isLive: boolean;
+    unavailableReason: 'entitlement_pending' | 'unavailable' | null;
+    observedAt: string;
+  };
 };
 
 export type TradeSide = 'buy' | 'sell';
@@ -99,6 +113,8 @@ export type ExecutionQuote = {
   }>;
 };
 
+export type ExecutionNetwork = 'devnet' | 'mainnet-beta';
+
 export type ExecutionReceipt = {
   id: string;
   createdAt: string;
@@ -112,15 +128,29 @@ export type ExecutionReceipt = {
   bestVenue: string;
   benchmarkPrice: number | null;
   premiumBps: number | null;
-  verified: false;
-  transactionSignature: null;
-  status: 'analysis';
+  verified: boolean;
+  transactionSignature: string | null;
+  status: 'analysis' | 'executed' | 'failed';
+  network: ExecutionNetwork | null;
+  actualAveragePrice: number | null;
+  actualFilledUsd: number | null;
   phoenixFeeUsd: number;
   phoenixFeeBps: number;
   feeStatus: 'projected' | 'collected';
   // SHA-256 over the receipt's evidentiary fields (everything but id/contentHash itself), so anyone
   // holding the receipt can prove it wasn't altered after the fact — independent of tx verification.
   contentHash: string;
+};
+
+// Passed to createExecutionReceipt only once a real on-chain transaction has been verified --
+// never constructed from client-claimed values, only from what transaction-verifier.ts observed.
+export type ExecutionResult = {
+  verified: boolean;
+  transactionSignature: string;
+  network: ExecutionNetwork;
+  status: 'executed' | 'failed';
+  actualAveragePrice: number | null;
+  actualFilledUsd: number | null;
 };
 
 export function calculateSpreadBps(bestBid: number, bestAsk: number) {
@@ -151,7 +181,16 @@ export function summarizeQuality(tone: QualityTone): string {
   return 'Wide spread or thin depth on this book may cause higher slippage.';
 }
 
-const round = (value: number, places = 2) => Number(value.toFixed(places));
+export const round = (value: number, places = 2) => Number(value.toFixed(places));
+
+// Shared by calculateExecutionQuote and the real-transaction builder in app.ts, so the real swap
+// that actually gets built always uses the exact same reference price / base-amount math as the
+// quote the user was shown.
+export function deriveReferenceAndBase(market: MarketSnapshot, side: TradeSide, requestedUsd: number): { referencePrice: number; requestedBase: number } {
+  const referencePrice = side === 'buy' ? market.asks[0]?.price : market.bids[0]?.price;
+  if (!referencePrice) throw new Error('ORDER_BOOK_EMPTY');
+  return { referencePrice, requestedBase: requestedUsd / referencePrice };
+}
 
 // Fetches a real Jupiter-routed price for the same trade, in the same units as the Phoenix-side
 // math above (quote-currency per base unit), so the two rows are genuinely comparable. Returns
@@ -190,10 +229,9 @@ async function fetchRealJupiterComparison(
 
 export async function calculateExecutionQuote(market: MarketSnapshot, side: TradeSide, requestedUsd: number, feePolicy: FeePolicy): Promise<ExecutionQuote> {
   const levels = side === 'buy' ? market.asks : market.bids;
-  const referencePrice = side === 'buy' ? market.asks[0]?.price : market.bids[0]?.price;
-  if (!referencePrice || levels.length === 0) throw new Error('ORDER_BOOK_EMPTY');
+  if (levels.length === 0) throw new Error('ORDER_BOOK_EMPTY');
+  const { referencePrice, requestedBase } = deriveReferenceAndBase(market, side, requestedUsd);
 
-  const requestedBase = requestedUsd / referencePrice;
   let remainingBase = requestedBase;
   let filledBase = 0;
   let filledNotional = 0;
@@ -286,7 +324,7 @@ export async function calculateExecutionQuote(market: MarketSnapshot, side: Trad
   };
 }
 
-export function createExecutionReceipt(market: MarketSnapshot, quote: ExecutionQuote): ExecutionReceipt {
+export function createExecutionReceipt(market: MarketSnapshot, quote: ExecutionQuote, execution?: ExecutionResult): ExecutionReceipt {
   const bestVenue = quote.venueQuotes.find((venue) => venue.best)?.venue ?? market.venue;
   const evidence = {
     createdAt: new Date().toISOString(),
@@ -302,16 +340,25 @@ export function createExecutionReceipt(market: MarketSnapshot, quote: ExecutionQ
     premiumBps: market.reference?.premiumBps ?? null,
     phoenixFeeUsd: quote.feeBreakdown.phoenixFeeUsd,
     phoenixFeeBps: quote.feeBreakdown.phoenixFeeBps,
+    verified: execution?.verified ?? false,
+    transactionSignature: execution?.transactionSignature ?? null,
+    status: (execution?.status ?? 'analysis') as ExecutionReceipt['status'],
+    network: execution?.network ?? null,
+    actualAveragePrice: execution?.actualAveragePrice ?? null,
+    actualFilledUsd: execution?.actualFilledUsd ?? null,
   };
   const contentHash = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+
+  // "Collected" only when a real mainnet transaction verified with fee collection turned on at
+  // quote time -- never inferred, since this is exactly the claim the business model rests on.
+  const feeStatus = execution?.verified && execution.network === 'mainnet-beta' && quote.feeBreakdown.collectionEnabled
+    ? 'collected'
+    : 'projected';
 
   return {
     id: `pxr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
     ...evidence,
-    verified: false,
-    transactionSignature: null,
-    status: 'analysis',
-    feeStatus: 'projected',
+    feeStatus,
     contentHash,
   };
 }

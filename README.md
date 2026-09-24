@@ -1,4 +1,4 @@
-# Phoenix Lens backend
+# Searix Trade backend
 
 A Fastify backend exposing a stable market-data and execution-intelligence contract, backed by a `CompositeMarketProvider`:
 

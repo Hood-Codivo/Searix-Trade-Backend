@@ -1,5 +1,5 @@
 {
-  "name": "@phoenix-lens/backend",
+  "name": "@searix-trade/backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -11,15 +11,20 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@clickhouse/client": "^1.23.1",
     "@ellipsis-labs/phoenix-sdk": "^2.0.3",
     "@fastify/cors": "latest",
     "@fastify/websocket": "latest",
+    "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.99.0",
     "fastify": "latest",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.0",
     "zod": "latest"
   },
   "devDependencies": {
     "@types/node": "latest",
+    "@types/pg": "^8.23.1",
     "typescript": "latest"
   }
 }

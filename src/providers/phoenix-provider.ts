@@ -1,6 +1,7 @@
 import { Client, type MarketState } from '@ellipsis-labs/phoenix-sdk';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { CandleHistory } from '../domain/candle-history.js';
+import { recordTick } from '../domain/clickhouse.js';
 import {
   calculateImbalance,
   calculateSpreadBps,
@@ -155,6 +156,7 @@ export class PhoenixProvider implements MarketProvider {
     const { score, label, tone } = scoreMarket(spreadBps, depthUsd, imbalance);
 
     this.candleHistory.record(address, price);
+    void recordTick(address, price);
 
     const header = marketState.data.header;
     const base = symbolForMint(header.baseParams.mintKey);
@@ -164,7 +166,10 @@ export class PhoenixProvider implements MarketProvider {
     this.baseMintByAddress.set(address, baseMint);
 
     const previous = this.markets.get(address);
-    const candles = previous ? [...previous.candles.slice(-19), price] : [price];
+    // Reuse the same real, range-aware history that /candles serves -- a separately-accumulated
+    // rolling buffer here would only ever hold ~20 raw ticks (far less real spread than we
+    // actually have), which is why the home-page sparkline was showing a near-flat line.
+    const candles = this.candleHistory.getCandles(address, '1m') ?? [price];
     // change24h/volume24h are real, but come from a separate batched Jupiter call (refreshStats),
     // not from book updates -- carry forward whatever that last set rather than reset it here.
     const change24h = previous?.change24h ?? 0;

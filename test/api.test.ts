@@ -132,6 +132,66 @@ describe('market API', () => {
     assert.deepEqual(response.json().data, []);
   });
 
+  it('builds a real devnet probe transaction for execution-transaction', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/markets/sol-usdc/execution-transaction',
+      payload: { side: 'buy', amountUsd: 10, userPublicKey: '11111111111111111111111111111111' },
+    });
+    const body = response.json();
+    assert.equal(response.statusCode, 200);
+    assert.equal(body.data.network, 'devnet');
+    assert.equal(body.data.kind, 'devnet-probe');
+    assert.ok(typeof body.data.transactionBase64 === 'string' && body.data.transactionBase64.length > 0);
+    assert.ok(body.data.lastValidBlockHeight > 0);
+  });
+
+  it('rejects execution-transaction requests that exceed the server-side USD cap', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/markets/sol-usdc/execution-transaction',
+      payload: { side: 'buy', amountUsd: 10_000, userPublicKey: '11111111111111111111111111111111' },
+    });
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error.code, 'AMOUNT_EXCEEDS_LIMIT');
+  });
+
+  it('rejects execution-transaction requests with an invalid wallet address', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/markets/sol-usdc/execution-transaction',
+      payload: { side: 'buy', amountUsd: 10, userPublicKey: '0'.repeat(44) },
+    });
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error.code, 'INVALID_WALLET_ADDRESS');
+  });
+
+  it('never marks a receipt verified for a signature that does not resolve on-chain', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/markets/sol-usdc/execution-confirm',
+      payload: {
+        signature: '1'.repeat(88),
+        network: 'devnet',
+        side: 'buy',
+        amountUsd: 10,
+        userPublicKey: '11111111111111111111111111111111',
+      },
+    });
+    assert.equal(response.statusCode, 422);
+    assert.equal(response.json().error.code, 'TRANSACTION_NOT_VERIFIED');
+  });
+
+  it('rejects a malformed execution-confirm request', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/markets/sol-usdc/execution-confirm',
+      payload: { signature: 'too-short', network: 'devnet', side: 'buy', amountUsd: 10, userPublicKey: '11111111111111111111111111111111' },
+    });
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error.code, 'INVALID_CONFIRM_REQUEST');
+  });
+
   it('returns the verified asset registry and a single entry by symbol', async () => {
     const list = await app.inject({ method: 'GET', url: '/v1/registry' });
     assert.equal(list.statusCode, 200);

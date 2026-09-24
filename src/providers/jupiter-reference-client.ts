@@ -1,3 +1,5 @@
+import { cached } from '../domain/redis.js';
+
 // Free, keyless price source for the real tokenized-stock markets: Jupiter's Price API returns
 // both the real on-chain token price (aggregated across Raydium/Jupiter liquidity) and, for
 // Backed Finance's "xStocks" specifically, a `stockData.price` field carrying the real underlying
@@ -35,44 +37,54 @@ export type MarketStats = {
 
 export class JupiterReferenceClient {
   async fetchPrices(mints: string[]): Promise<Map<string, ReferencePrice>> {
-    const response = await fetch(`${PRICE_URL}?ids=${encodeURIComponent(mints.join(','))}`, {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(6_000),
-    });
-    if (!response.ok) throw new Error(`JUPITER_HTTP_${response.status}`);
-    const payload = await response.json() as JupiterPriceResponse;
-
-    const result = new Map<string, ReferencePrice>();
-    for (const mint of mints) {
-      const entry = payload[mint];
-      if (!entry || !Number.isFinite(entry.usdPrice)) continue;
-      result.set(mint, {
-        tokenPrice: entry.usdPrice,
-        underlyingPrice: entry.stockData?.price ?? null,
-        observedAt: entry.stockData?.updatedAt ?? new Date().toISOString(),
+    const key = `jupiter:prices:${[...mints].sort().join(',')}`;
+    // 15s TTL: real de-duplication of concurrent/rapid calls for the same mints, short enough
+    // that no caller ever sees data staler than half our own poll interval.
+    const entries = await cached<[string, ReferencePrice][]>(key, 15, async () => {
+      const response = await fetch(`${PRICE_URL}?ids=${encodeURIComponent(mints.join(','))}`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(6_000),
       });
-    }
-    return result;
+      if (!response.ok) throw new Error(`JUPITER_HTTP_${response.status}`);
+      const payload = await response.json() as JupiterPriceResponse;
+
+      const result: [string, ReferencePrice][] = [];
+      for (const mint of mints) {
+        const entry = payload[mint];
+        if (!entry || !Number.isFinite(entry.usdPrice)) continue;
+        result.push([mint, {
+          tokenPrice: entry.usdPrice,
+          underlyingPrice: entry.stockData?.price ?? null,
+          observedAt: entry.stockData?.updatedAt ?? new Date().toISOString(),
+        }]);
+      }
+      return result;
+    });
+    return new Map(entries);
   }
 
   async fetchStats(mints: string[]): Promise<Map<string, MarketStats>> {
     if (mints.length === 0) return new Map();
-    const response = await fetch(`${SEARCH_URL}?query=${encodeURIComponent(mints.join(','))}`, {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(6_000),
-    });
-    if (!response.ok) throw new Error(`JUPITER_HTTP_${response.status}`);
-    const payload = await response.json() as JupiterSearchEntry[];
-
-    const result = new Map<string, MarketStats>();
-    for (const entry of payload) {
-      const stats = entry.stats24h;
-      result.set(entry.id, {
-        change24h: stats?.priceChange ?? 0,
-        volume24h: (stats?.buyVolume ?? 0) + (stats?.sellVolume ?? 0),
-        liquidity: entry.liquidity ?? 0,
+    const key = `jupiter:stats:${[...mints].sort().join(',')}`;
+    const entries = await cached<[string, MarketStats][]>(key, 15, async () => {
+      const response = await fetch(`${SEARCH_URL}?query=${encodeURIComponent(mints.join(','))}`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(6_000),
       });
-    }
-    return result;
+      if (!response.ok) throw new Error(`JUPITER_HTTP_${response.status}`);
+      const payload = await response.json() as JupiterSearchEntry[];
+
+      const result: [string, MarketStats][] = [];
+      for (const entry of payload) {
+        const stats = entry.stats24h;
+        result.push([entry.id, {
+          change24h: stats?.priceChange ?? 0,
+          volume24h: (stats?.buyVolume ?? 0) + (stats?.sellVolume ?? 0),
+          liquidity: entry.liquidity ?? 0,
+        }]);
+      }
+      return result;
+    });
+    return new Map(entries);
   }
 }

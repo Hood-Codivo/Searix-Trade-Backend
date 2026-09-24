@@ -1,7 +1,11 @@
 import { createApp } from "./app.js";
 import { feePolicyFromEnvironment } from "./domain/fee-policy.js";
-import { FileReceiptRepository } from "./domain/receipt-repository.js";
-import { FileAlertRepository } from "./domain/alert-repository.js";
+import { executionConfigFromEnvironment } from "./domain/execution-config.js";
+import { isDatabaseConfigured } from "./domain/db.js";
+import { FileReceiptRepository, type ReceiptRepository } from "./domain/receipt-repository.js";
+import { FileAlertRepository, type AlertRepository } from "./domain/alert-repository.js";
+import { PostgresReceiptRepository } from "./domain/postgres-receipt-repository.js";
+import { PostgresAlertRepository } from "./domain/postgres-alert-repository.js";
 import { CompositeMarketProvider } from "./providers/composite-market-provider.js";
 import type { MarketProvider } from "./providers/market-provider.js";
 import { PegAlertMonitor } from "./providers/peg-alert-monitor.js";
@@ -25,14 +29,22 @@ function buildProvider(): MarketProvider {
     ? undefined
     : process.env.SOLANA_WS_URL;
   const phoenixProvider = new PhoenixProvider({ rpcUrl, wsUrl, marketAddresses });
-  const stockProvider = new TokenizedStockProvider();
+  const stockProvider = new TokenizedStockProvider(20_000, true, undefined, process.env.PYTH_API_KEY);
   return new CompositeMarketProvider([phoenixProvider, stockProvider]);
 }
 
 const provider = buildProvider();
-const receipts = new FileReceiptRepository(process.env.RECEIPTS_FILE_PATH ?? "data/receipts.json");
-const alerts = new FileAlertRepository(process.env.ALERTS_FILE_PATH ?? "data/alerts.json");
-const app = await createApp(provider, receipts, feePolicyFromEnvironment(), alerts);
+const receiptsFilePath = process.env.RECEIPTS_FILE_PATH ?? "data/receipts.json";
+const alertsFilePath = process.env.ALERTS_FILE_PATH ?? "data/alerts.json";
+// Postgres survives a Render redeploy; the file-backed repositories don't (ephemeral filesystem).
+// Falls back to file storage when DATABASE_URL isn't set, e.g. local dev without a database.
+const receipts: ReceiptRepository = isDatabaseConfigured()
+  ? new PostgresReceiptRepository(receiptsFilePath)
+  : new FileReceiptRepository(receiptsFilePath);
+const alerts: AlertRepository = isDatabaseConfigured()
+  ? new PostgresAlertRepository(alertsFilePath)
+  : new FileAlertRepository(alertsFilePath);
+const app = await createApp(provider, receipts, feePolicyFromEnvironment(), alerts, executionConfigFromEnvironment());
 
 const pegAlertMonitor = new PegAlertMonitor(provider, alerts);
 pegAlertMonitor.start();

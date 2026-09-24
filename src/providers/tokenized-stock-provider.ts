@@ -1,8 +1,10 @@
 import { CandleHistory } from '../domain/candle-history.js';
+import { recordTick } from '../domain/clickhouse.js';
 import { calculateImbalance, calculateSpreadBps, scoreMarket, summarizeQuality, type CandleRange, type MarketSnapshot, type OrderLevel } from '../domain/market.js';
 import type { MarketProvider, MarketUpdate } from './market-provider.js';
 import { JupiterReferenceClient } from './jupiter-reference-client.js';
 import { USDC_MINT } from './jupiter-swap-quote.js';
+import { fetchPythPrices } from './pyth-client.js';
 
 type StockConfig = {
   id: string;
@@ -15,6 +17,12 @@ type StockConfig = {
   quoteMint: string;
   baseDecimals: number;
   quoteDecimals: number;
+  // Real Pyth Hermes feed ids, confirmed live via the discovery endpoint (v2/price_feeds) --
+  // not guessed. Equity/xStock feeds currently return "not entitled" on a free-tier key; the
+  // ids themselves are real regardless of grant status.
+  pythEquityFeedId: string;
+  pythTokenFeedId: string;
+  pythRedemptionRateFeedId: string;
 };
 
 // Real, independently-verified xStocks (Backed Finance) mints on Solana mainnet -- confirmed via
@@ -23,9 +31,12 @@ type StockConfig = {
 // No price, book, quality, or candle data is ever seeded -- a market only appears in list()/get()
 // once a real fetch has actually populated it.
 const configs: StockConfig[] = [
-  { id: 'aaplx-usdc', base: 'AAPLX', quote: 'USDC', underlyingSymbol: 'AAPL', underlyingFeed: 'AAPL', tokenFeed: 'AAPLx', baseMint: 'XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp', quoteMint: USDC_MINT, baseDecimals: 8, quoteDecimals: 6 },
-  { id: 'tslax-usdc', base: 'TSLAX', quote: 'USDC', underlyingSymbol: 'TSLA', underlyingFeed: 'TSLA', tokenFeed: 'TSLAx', baseMint: 'XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB', quoteMint: USDC_MINT, baseDecimals: 8, quoteDecimals: 6 },
-  { id: 'nvdax-usdc', base: 'NVDAX', quote: 'USDC', underlyingSymbol: 'NVDA', underlyingFeed: 'NVDA', tokenFeed: 'NVDAx', baseMint: 'Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh', quoteMint: USDC_MINT, baseDecimals: 8, quoteDecimals: 6 },
+  { id: 'aaplx-usdc', base: 'AAPLX', quote: 'USDC', underlyingSymbol: 'AAPL', underlyingFeed: 'AAPL', tokenFeed: 'AAPLx', baseMint: 'XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp', quoteMint: USDC_MINT, baseDecimals: 8, quoteDecimals: 6,
+    pythEquityFeedId: '49f6b65cb1de6b10eaf75e7c03ca029c306d0357e91b5311b175084a5ad55688', pythTokenFeedId: '978e6cc68a119ce066aa830017318563a9ed04ec3a0a6439010fc11296a58675', pythRedemptionRateFeedId: '25babb83691a056fd65f879bfd7197eabd840aae741f69c87ccb31e204a979b2' },
+  { id: 'tslax-usdc', base: 'TSLAX', quote: 'USDC', underlyingSymbol: 'TSLA', underlyingFeed: 'TSLA', tokenFeed: 'TSLAx', baseMint: 'XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB', quoteMint: USDC_MINT, baseDecimals: 8, quoteDecimals: 6,
+    pythEquityFeedId: '16dad506d7db8da01c87581c87ca897a012a153557d4d578c3b9c9e1bc0632f1', pythTokenFeedId: '47a156470288850a440df3a6ce85a55917b813a19bb5b31128a33a986566a362', pythRedemptionRateFeedId: '997362625415627e9e3177f6c0d32f200d4a221ccadb3dddab80d6079d03ea24' },
+  { id: 'nvdax-usdc', base: 'NVDAX', quote: 'USDC', underlyingSymbol: 'NVDA', underlyingFeed: 'NVDA', tokenFeed: 'NVDAx', baseMint: 'Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh', quoteMint: USDC_MINT, baseDecimals: 8, quoteDecimals: 6,
+    pythEquityFeedId: 'b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593', pythTokenFeedId: '4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f', pythRedemptionRateFeedId: 'b675c4e9f46d94afa9174a7df09966b77a2950970bb50a77ec8ad4fcfd8266f4' },
 ];
 
 // AMMs have no discrete order-book levels to read, real or otherwise -- this distributes real
@@ -69,6 +80,7 @@ export class TokenizedStockProvider implements MarketProvider {
     private readonly pollMs = 20_000,
     private readonly enablePolling = true,
     private readonly jupiter: JupiterReferenceClient = new JupiterReferenceClient(),
+    private readonly pythApiKey: string | undefined = process.env.PYTH_API_KEY,
   ) {}
 
   async start() {
@@ -102,9 +114,16 @@ export class TokenizedStockProvider implements MarketProvider {
   private async refreshPrices() {
     try {
       const mints = configs.map((config) => config.baseMint);
-      const [prices, stats] = await Promise.all([
+      const [prices, stats, pythEquity, pythToken, pythRR] = await Promise.all([
         this.jupiter.fetchPrices(mints),
         this.jupiter.fetchStats(mints).catch(() => new Map()),
+        // Fetched as three separate category calls rather than one combined batch: Hermes returns
+        // a whole-batch 403 if any single requested feed isn't entitled, so grouping this way means
+        // one category (e.g. redemption-rate) coming online doesn't get masked by another still
+        // being gated.
+        fetchPythPrices(configs.map((c) => c.pythEquityFeedId), this.pythApiKey),
+        fetchPythPrices(configs.map((c) => c.pythTokenFeedId), this.pythApiKey),
+        fetchPythPrices(configs.map((c) => c.pythRedemptionRateFeedId), this.pythApiKey),
       ]);
       const marketState = usMarketState();
       let anyLive = false;
@@ -125,10 +144,25 @@ export class TokenizedStockProvider implements MarketProvider {
         const { score, label, tone } = scoreMarket(spreadBps, depthUsd, imbalance);
 
         const previous = this.markets.get(config.id);
-        const candles = previous ? [...previous.candles.slice(-19), priced.tokenPrice] : [priced.tokenPrice];
         this.candleHistory.record(config.id, priced.tokenPrice, Date.now());
+        void recordTick(config.id, priced.tokenPrice);
+        // Reuse the same real, range-aware history /candles serves -- see the identical fix and
+        // rationale in phoenix-provider.ts.
+        const candles = this.candleHistory.getCandles(config.id, '1m') ?? [priced.tokenPrice];
 
         const premiumBps = ((priced.tokenPrice - priced.underlyingPrice) / priced.underlyingPrice) * 10_000;
+
+        const equityPoint = pythEquity.prices.get(config.pythEquityFeedId) ?? null;
+        const tokenPoint = pythToken.prices.get(config.pythTokenFeedId) ?? null;
+        const rrPoint = pythRR.prices.get(config.pythRedemptionRateFeedId) ?? null;
+        const pythIsLive = equityPoint !== null && tokenPoint !== null;
+        // Prefer Pyth's own first-party redemption-rate feed for the premium when it's entitled;
+        // fall back to deriving it from the two price feeds -- both are real Pyth data, just from
+        // a different feed combination, never fabricated.
+        const pythPremiumBps = rrPoint !== null
+          ? (rrPoint.price - 1) * 10_000
+          : pythIsLive ? ((tokenPoint!.price - equityPoint!.price) / equityPoint!.price) * 10_000 : null;
+        const anyPythEntitled = pythEquity.entitled || pythToken.entitled || pythRR.entitled;
 
         const market: MarketSnapshot = {
           id: config.id,
@@ -157,6 +191,16 @@ export class TokenizedStockProvider implements MarketProvider {
             marketState,
             isLive: true,
             observedAt: priced.observedAt,
+          },
+          pyth: {
+            source: 'Pyth',
+            equityPrice: equityPoint?.price ?? null,
+            tokenPrice: tokenPoint?.price ?? null,
+            redemptionRate: rrPoint?.price ?? null,
+            premiumBps: pythPremiumBps,
+            isLive: pythIsLive,
+            unavailableReason: pythIsLive ? null : anyPythEntitled ? 'unavailable' : 'entitlement_pending',
+            observedAt: new Date().toISOString(),
           },
           quality: { score, label, tone, summary: summarizeQuality(tone) },
           bids,
