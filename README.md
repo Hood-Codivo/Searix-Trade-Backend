@@ -49,4 +49,4 @@ optional. At minimum you need `SOLANA_RPC_URL` and `PHOENIX_MARKET_IDS` for live
 - Authentication, rate limiting, a restricted production CORS allowlist (currently allows all origins)
 - Receipt hash verification endpoint (let anyone independently confirm a saved receipt's `contentHash` wasn't altered after the fact)
 - CI/CD, provider failover, secrets management, a full security review
-- Corporate-action monitoring (dividends, splits, custodian changes, suspensions) — needs a verified real data source before it can be committed to; not yet researched
+- Corporate-action monitoring (dividends, splits, custodian changes, suspensions) — needs a verified real data source before it can be committed to; not yet researched.
