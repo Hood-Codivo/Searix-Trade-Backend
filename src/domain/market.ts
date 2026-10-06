@@ -108,6 +108,9 @@ export type ExecutionQuote = {
     averagePrice: number;
     priceImpactBps: number;
     estimatedTotalUsd: number;
+    // How much of the traded asset this route gives you (buy: received, sell: sold) and the USD side of the trade.
+    expectedBase: number;
+    expectedQuote: number;
     best: boolean;
     isLive: boolean;
   }>;
@@ -134,6 +137,10 @@ export type ExecutionReceipt = {
   network: ExecutionNetwork | null;
   actualAveragePrice: number | null;
   actualFilledUsd: number | null;
+  // How much of the asset was actually bought or sold, and the wallet that did it. Holdings are built from these.
+  actualBaseAmount: number | null;
+  expectedBaseAmount: number;
+  walletAddress: string | null;
   phoenixFeeUsd: number;
   phoenixFeeBps: number;
   feeStatus: 'projected' | 'collected';
@@ -151,6 +158,8 @@ export type ExecutionResult = {
   status: 'executed' | 'failed';
   actualAveragePrice: number | null;
   actualFilledUsd: number | null;
+  actualBaseAmount: number | null;
+  walletAddress: string;
 };
 
 export function calculateSpreadBps(bestBid: number, bestAsk: number) {
@@ -213,7 +222,7 @@ async function fetchRealJupiterComparison(
     if (outBase <= 0) return null;
     const averagePrice = requestedUsd / outBase;
     const priceImpactBps = Math.max(0, ((averagePrice - referencePrice) / referencePrice) * 10_000);
-    return { venue: 'Jupiter', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(requestedUsd), best: false, isLive: true };
+    return { venue: 'Jupiter', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(requestedUsd), expectedBase: round(outBase, 10), expectedQuote: round(requestedUsd), best: false, isLive: true };
   }
 
   const inputAtoms = BigInt(Math.round(requestedBase * 10 ** market.baseDecimals));
@@ -224,7 +233,7 @@ async function fetchRealJupiterComparison(
   if (outUsd <= 0 || requestedBase <= 0) return null;
   const averagePrice = outUsd / requestedBase;
   const priceImpactBps = Math.max(0, ((referencePrice - averagePrice) / referencePrice) * 10_000);
-  return { venue: 'Jupiter', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(outUsd), best: false, isLive: true };
+  return { venue: 'Jupiter', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(outUsd), expectedBase: round(requestedBase, 10), expectedQuote: round(outUsd), best: false, isLive: true };
 }
 
 export async function calculateExecutionQuote(market: MarketSnapshot, side: TradeSide, requestedUsd: number, feePolicy: FeePolicy): Promise<ExecutionQuote> {
@@ -282,7 +291,7 @@ export async function calculateExecutionQuote(market: MarketSnapshot, side: Trad
   // Tokenized stocks have no real Phoenix book, so their Phoenix row is a simulated ladder and is
   // marked not live -- it is shown for context but never chosen as the executable route.
   const venueQuotes: ExecutionQuote['venueQuotes'] = [
-    { venue: 'Phoenix', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(phoenixTotal), best: false, isLive: market.assetClass !== 'tokenized-stock' },
+    { venue: 'Phoenix', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(phoenixTotal), expectedBase: round(filledBase, 10), expectedQuote: round(filledNotional), best: false, isLive: market.assetClass !== 'tokenized-stock' },
   ];
   const jupiterRow = await fetchRealJupiterComparison(market, side, requestedUsd, requestedBase, referencePrice);
   if (jupiterRow) venueQuotes.push(jupiterRow);
@@ -350,6 +359,9 @@ export function createExecutionReceipt(market: MarketSnapshot, quote: ExecutionQ
     network: execution?.network ?? null,
     actualAveragePrice: execution?.actualAveragePrice ?? null,
     actualFilledUsd: execution?.actualFilledUsd ?? null,
+    actualBaseAmount: execution?.actualBaseAmount ?? null,
+    expectedBaseAmount: quote.venueQuotes.find((venue) => venue.best)?.expectedBase ?? 0,
+    walletAddress: execution?.walletAddress ?? null,
   };
   const contentHash = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
 

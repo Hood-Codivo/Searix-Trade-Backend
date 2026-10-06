@@ -8,3 +8,6 @@ dist/
 .DS_Store
 data/
 
+
+# Local secrets (payer keypairs). Never commit.
+secrets/

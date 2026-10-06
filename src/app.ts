@@ -11,9 +11,12 @@ import { deriveTreasuryFeeAccount } from './domain/treasury.js';
 import { InMemoryReceiptRepository, type ReceiptRepository } from './domain/receipt-repository.js';
 import { InMemoryAlertRepository, type AlertRepository } from './domain/alert-repository.js';
 import { assetRegistry, getRegistryEntry } from './domain/registry.js';
+import { executedTradesFor, holdingsFrom } from './domain/holdings.js';
 import type { MarketProvider } from './providers/market-provider.js';
 import { fetchJupiterSwapQuote } from './providers/jupiter-swap-quote.js';
 import { buildJupiterSwapTransaction } from './providers/jupiter-swap-builder.js';
+import { shortfallFor, simulateBeforeSigning } from './domain/simulation.js';
+import { tokenProgramForMint } from './domain/treasury.js';
 
 // Reports what a receipt/alert repository is actually backed by, rather than a hardcoded label --
 // keeps this honest as PostgresReceiptRepository/PostgresAlertRepository get added alongside the
@@ -27,6 +30,7 @@ function persistenceLabel(repository: ReceiptRepository | AlertRepository): 'mem
 
 const marketParams = z.object({ id: z.string().min(1).max(64) });
 const symbolParams = z.object({ symbol: z.string().min(1).max(16) });
+const walletParams = z.object({ address: z.string().min(32).max(44) });
 const candleQuery = z.object({ range: z.enum(['1h', '1d', '1w', '1m']).optional() });
 const executionQuoteBody = z.object({
   side: z.enum(['buy', 'sell']),
@@ -183,6 +187,12 @@ export async function createApp(
     const inputAtoms = BigInt(Math.round(inputAmount * 10 ** inputDecimals));
     if (inputAtoms <= 0n) return reply.code(400).send({ error: { code: 'AMOUNT_TOO_SMALL', message: 'That amount rounds to zero on-chain.' } });
 
+    const spendMint = inputMint!;
+    const spendDecimals = inputDecimals!;
+    const spendSymbol = body.data.side === 'buy' ? market.quote : market.base;
+    const shortfall = await shortfallFor(body.data.userPublicKey, spendMint, spendSymbol, inputAtoms, spendDecimals, executionConfig.rpcUrls.mainnet, tokenProgramForMint(spendMint));
+    if (shortfall) return reply.code(400).send({ error: { code: 'INSUFFICIENT_BALANCE', message: `Not enough to place this order: ${shortfall}` } });
+
     const platformFeeBps = feePolicy.enabled ? feePolicy.standardFeeBps : undefined;
     const swapQuote = await fetchJupiterSwapQuote(inputMint, outputMint, inputAtoms.toString(), platformFeeBps);
     if (!swapQuote) return reply.code(502).send({ error: { code: 'QUOTE_UNAVAILABLE', message: 'Could not get a live swap route for this trade right now.' } });
@@ -193,6 +203,8 @@ export async function createApp(
 
     const built = await buildJupiterSwapTransaction({ quoteResponse: swapQuote.raw, userPublicKey: body.data.userPublicKey, feeAccount });
     if (!built) return reply.code(502).send({ error: { code: 'TRANSACTION_BUILD_FAILED', message: 'Could not build a live swap transaction right now.' } });
+    const check = await simulateBeforeSigning(built.transactionBase64, executionConfig.rpcUrls.mainnet);
+    if (!check.ok) return reply.code(422).send({ error: { code: 'SIMULATION_FAILED', message: `This swap would fail on-chain: ${check.reason}` } });
     return { data: { ...built, network: 'mainnet-beta', kind: 'jupiter-swap', venue: 'Jupiter' } };
   });
 
@@ -212,6 +224,7 @@ export async function createApp(
 
     let actualAveragePrice: number | null = null;
     let actualFilledUsd: number | null = null;
+    let actualBaseAmount: number | null = null;
     if (body.data.network === 'mainnet-beta' && market.baseMint && market.quoteMint && market.baseDecimals !== undefined && market.quoteDecimals !== undefined) {
       const inputMint = body.data.side === 'buy' ? market.quoteMint : market.baseMint;
       const outputMint = body.data.side === 'buy' ? market.baseMint : market.quoteMint;
@@ -222,6 +235,8 @@ export async function createApp(
       const feeAccountForFill = feePolicy.enabled && feePolicy.treasuryAddress ? deriveTreasuryFeeAccount(feePolicy.treasuryAddress, inputMint) : undefined;
       const fill = extractTokenFill(verification.transaction, body.data.userPublicKey, inputMint, outputMint, inputDecimals, outputDecimals, feeAccountForFill);
       if (fill) {
+        // The base asset is what comes in on a buy and what goes out on a sell.
+        actualBaseAmount = round(body.data.side === 'buy' ? fill.outputAmount : fill.inputAmount, 10);
         if (body.data.side === 'buy') {
           actualFilledUsd = round(fill.inputAmount);
           actualAveragePrice = fill.outputAmount > 0 ? round(fill.inputAmount / fill.outputAmount, 10) : null;
@@ -240,8 +255,24 @@ export async function createApp(
       status: 'executed',
       actualAveragePrice,
       actualFilledUsd,
+      actualBaseAmount,
+      walletAddress: body.data.userPublicKey,
     }));
     return reply.code(201).send({ data: saved, meta: { verified: true } });
+  });
+
+  // A wallet's own executed trades, newest first.
+  app.get('/v1/wallets/:address/executions', async (request, reply) => {
+    const params = walletParams.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ error: { code: 'INVALID_WALLET_ADDRESS', message: 'That is not a valid wallet address.' } });
+    return { data: executedTradesFor(await receipts.list(), params.data.address) };
+  });
+
+  // Net holdings per asset for one wallet, built from confirmed fills only.
+  app.get('/v1/wallets/:address/holdings', async (request, reply) => {
+    const params = walletParams.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ error: { code: 'INVALID_WALLET_ADDRESS', message: 'That is not a valid wallet address.' } });
+    return { data: holdingsFrom(executedTradesFor(await receipts.list(), params.data.address)) };
   });
 
   app.get('/v1/execution-receipts', async () => ({
