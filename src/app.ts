@@ -12,6 +12,7 @@ import { InMemoryReceiptRepository, type ReceiptRepository } from './domain/rece
 import { InMemoryAlertRepository, type AlertRepository } from './domain/alert-repository.js';
 import { assetRegistry, getRegistryEntry } from './domain/registry.js';
 import { executedTradesFor, holdingsFrom } from './domain/holdings.js';
+import { readWalletBalances } from './domain/wallet-balances.js';
 import type { MarketProvider } from './providers/market-provider.js';
 import { fetchJupiterSwapQuote } from './providers/jupiter-swap-quote.js';
 import { buildJupiterSwapTransaction } from './providers/jupiter-swap-builder.js';
@@ -259,6 +260,17 @@ export async function createApp(
       walletAddress: body.data.userPublicKey,
     }));
     return reply.code(201).send({ data: saved, meta: { verified: true } });
+  });
+
+  // A wallet's real on-chain SOL and token balances.
+  app.get('/v1/wallets/:address/balances', async (request, reply) => {
+    const params = walletParams.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ error: { code: 'INVALID_WALLET_ADDRESS', message: 'That is not a valid wallet address.' } });
+    try {
+      return { data: await readWalletBalances(params.data.address, executionConfig.rpcUrls.mainnet) };
+    } catch {
+      return reply.code(502).send({ error: { code: 'BALANCE_UNAVAILABLE', message: 'Could not read this wallet\'s balances right now.' } });
+    }
   });
 
   // A wallet's own executed trades, newest first.
