@@ -13,6 +13,8 @@ import { InMemoryAlertRepository, type AlertRepository } from './domain/alert-re
 import { assetRegistry, getRegistryEntry } from './domain/registry.js';
 import { executedTradesFor, holdingsFrom } from './domain/holdings.js';
 import { readWalletBalances } from './domain/wallet-balances.js';
+import { positionsPnl } from './domain/pnl.js';
+import { FileAlertRuleStore } from './domain/alert-rules.js';
 import type { MarketProvider } from './providers/market-provider.js';
 import { fetchJupiterSwapQuote } from './providers/jupiter-swap-quote.js';
 import { buildJupiterSwapTransaction } from './providers/jupiter-swap-builder.js';
@@ -32,6 +34,13 @@ function persistenceLabel(repository: ReceiptRepository | AlertRepository): 'mem
 const marketParams = z.object({ id: z.string().min(1).max(64) });
 const symbolParams = z.object({ symbol: z.string().min(1).max(16) });
 const walletParams = z.object({ address: z.string().min(32).max(44) });
+const alertRuleBody = z.object({
+  walletAddress: z.string().min(32).max(44),
+  marketId: z.string().min(1).max(64),
+  kind: z.enum(['price', 'premium']),
+  direction: z.enum(['above', 'below']),
+  threshold: z.number().finite(),
+});
 const candleQuery = z.object({ range: z.enum(['1h', '1d', '1w', '1m']).optional() });
 const executionQuoteBody = z.object({
   side: z.enum(['buy', 'sell']),
@@ -56,6 +65,7 @@ export async function createApp(
   feePolicy: FeePolicy = previewFeePolicy,
   alerts: AlertRepository = new InMemoryAlertRepository(),
   executionConfig: ExecutionConfig = previewExecutionConfig,
+  alertRules: FileAlertRuleStore = new FileAlertRuleStore('data/alert-rules.json'),
 ) {
   const app = Fastify({ logger: process.env.NODE_ENV !== 'test' });
   await app.register(cors, { origin: true });
@@ -262,6 +272,14 @@ export async function createApp(
     return reply.code(201).send({ data: saved, meta: { verified: true } });
   });
 
+  // Average-cost profit and loss per asset, marked to the live market price.
+  app.get('/v1/wallets/:address/pnl', async (request, reply) => {
+    const params = walletParams.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ error: { code: 'INVALID_WALLET_ADDRESS', message: 'That is not a valid wallet address.' } });
+    const trades = executedTradesFor(await receipts.list(), params.data.address);
+    return { data: positionsPnl(trades, provider.list()) };
+  });
+
   // A wallet's real on-chain SOL and token balances.
   app.get('/v1/wallets/:address/balances', async (request, reply) => {
     const params = walletParams.safeParse(request.params);
@@ -314,7 +332,34 @@ export async function createApp(
     };
   });
 
-  app.get('/v1/alerts', async () => ({ data: await alerts.list() }));
+  // Market-wide alerts for everyone, plus rule alerts that belong to the asking wallet only.
+  app.get('/v1/alerts', async (request) => {
+    const wallet = typeof (request.query as { wallet?: unknown }).wallet === 'string' ? (request.query as { wallet: string }).wallet : undefined;
+    const visible = (await alerts.list()).filter((alert) => !alert.walletAddress || alert.walletAddress === wallet);
+    return { data: visible };
+  });
+
+  app.get('/v1/alert-rules', async (request, reply) => {
+    const wallet = (request.query as { wallet?: string }).wallet;
+    const params = walletParams.safeParse({ address: wallet ?? '' });
+    if (!params.success) return reply.code(400).send({ error: { code: 'INVALID_WALLET_ADDRESS', message: 'Pass your wallet address to see your alerts.' } });
+    return { data: await alertRules.list(params.data.address) };
+  });
+
+  app.post('/v1/alert-rules', async (request, reply) => {
+    const body = alertRuleBody.safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: { code: 'INVALID_ALERT_RULE', message: 'Choose a market, price or premium, above or below, and a threshold.' } });
+    if (!provider.get(body.data.marketId)) return reply.code(404).send({ error: { code: 'MARKET_NOT_FOUND', message: 'That market is not being tracked.' } });
+    const rule = await alertRules.add({ ...body.data, id: `rule_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`, createdAt: new Date().toISOString() });
+    return reply.code(201).send({ data: rule });
+  });
+
+  app.delete('/v1/alert-rules/:id', async (request, reply) => {
+    const wallet = (request.query as { wallet?: string }).wallet ?? '';
+    const params = z.object({ id: z.string().min(1).max(80) }).safeParse(request.params);
+    if (!params.success || !(await alertRules.remove(params.data.id, wallet))) return reply.code(404).send({ error: { code: 'ALERT_RULE_NOT_FOUND', message: 'That alert is not yours or no longer exists.' } });
+    return { data: { removed: true } };
+  });
 
   app.get('/v1/registry', async () => ({ data: assetRegistry }));
 

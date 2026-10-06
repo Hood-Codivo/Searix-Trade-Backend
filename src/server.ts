@@ -9,6 +9,7 @@ import { PostgresAlertRepository } from "./domain/postgres-alert-repository.js";
 import { CompositeMarketProvider } from "./providers/composite-market-provider.js";
 import type { MarketProvider } from "./providers/market-provider.js";
 import { PegAlertMonitor } from "./providers/peg-alert-monitor.js";
+import { AlertRuleMonitor, FileAlertRuleStore } from "./domain/alert-rules.js";
 import { PhoenixProvider } from "./providers/phoenix-provider.js";
 import { TokenizedStockProvider } from "./providers/tokenized-stock-provider.js";
 
@@ -44,11 +45,14 @@ const receipts: ReceiptRepository = isDatabaseConfigured()
 const alerts: AlertRepository = isDatabaseConfigured()
   ? new PostgresAlertRepository(alertsFilePath)
   : new FileAlertRepository(alertsFilePath);
-const app = await createApp(provider, receipts, feePolicyFromEnvironment(), alerts, executionConfigFromEnvironment());
+const alertRules = new FileAlertRuleStore("data/alert-rules.json");
+const app = await createApp(provider, receipts, feePolicyFromEnvironment(), alerts, executionConfigFromEnvironment(), alertRules);
 
 const pegAlertMonitor = new PegAlertMonitor(provider, alerts);
 pegAlertMonitor.start();
-app.addHook("onClose", async () => pegAlertMonitor.stop());
+const alertRuleMonitor = new AlertRuleMonitor(provider, alertRules, alerts);
+alertRuleMonitor.start();
+app.addHook("onClose", async () => { pegAlertMonitor.stop(); alertRuleMonitor.stop(); });
 
 try {
   await app.listen({ port, host });

@@ -6,10 +6,13 @@ export type Alert = {
   id: string;
   marketId: string;
   symbol: string;
-  kind: 'premium-deterioration';
+  kind: 'premium-deterioration' | 'rule-triggered';
   severity: AlertSeverity;
-  premiumBps: number;
-  thresholdBps: number;
+  // Premium-based alerts carry these; a price rule leaves them null.
+  premiumBps: number | null;
+  thresholdBps: number | null;
+  // Set for alerts raised by a user's own rule; global market alerts leave it unset.
+  walletAddress?: string;
   message: string;
   createdAt: string;
 };
