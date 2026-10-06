@@ -132,18 +132,14 @@ describe('market API', () => {
     assert.deepEqual(response.json().data, []);
   });
 
-  it('builds a real devnet probe transaction for execution-transaction', async () => {
+  it('refuses to build a swap for a market with no on-chain mints', async () => {
     const response = await app.inject({
       method: 'POST',
       url: '/v1/markets/sol-usdc/execution-transaction',
       payload: { side: 'buy', amountUsd: 10, userPublicKey: '11111111111111111111111111111111' },
     });
-    const body = response.json();
-    assert.equal(response.statusCode, 200);
-    assert.equal(body.data.network, 'devnet');
-    assert.equal(body.data.kind, 'devnet-probe');
-    assert.ok(typeof body.data.transactionBase64 === 'string' && body.data.transactionBase64.length > 0);
-    assert.ok(body.data.lastValidBlockHeight > 0);
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error.code, 'MARKET_NOT_EXECUTABLE');
   });
 
   it('rejects execution-transaction requests that exceed the server-side USD cap', async () => {
@@ -172,7 +168,7 @@ describe('market API', () => {
       url: '/v1/markets/sol-usdc/execution-confirm',
       payload: {
         signature: '1'.repeat(88),
-        network: 'devnet',
+        network: 'mainnet-beta',
         side: 'buy',
         amountUsd: 10,
         userPublicKey: '11111111111111111111111111111111',
@@ -186,7 +182,7 @@ describe('market API', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/v1/markets/sol-usdc/execution-confirm',
-      payload: { signature: 'too-short', network: 'devnet', side: 'buy', amountUsd: 10, userPublicKey: '11111111111111111111111111111111' },
+      payload: { signature: 'too-short', network: 'mainnet-beta', side: 'buy', amountUsd: 10, userPublicKey: '11111111111111111111111111111111' },
     });
     assert.equal(response.statusCode, 400);
     assert.equal(response.json().error.code, 'INVALID_CONFIRM_REQUEST');

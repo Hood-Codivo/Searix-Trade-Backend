@@ -15,7 +15,7 @@ surfaces — no simulated data anywhere in the response contract.
   - **ClickHouse** (`@clickhouse/client`) — real tick-by-tick price history (`market_ticks`, `MergeTree`), auto-creates its database/table on first boot. Recording is a fire-and-forget no-op when `CLICKHOUSE_URL` is unset.
   - **Redis** (`ioredis`) — short-TTL (15s) cache-aside in front of the two Jupiter API calls, with graceful fallback to a live fetch on any cache miss or Redis error. No-op when `REDIS_URL` is unset.
 - **External data/execution APIs** (all real, no fabricated fallback data):
-  - Solana mainnet + devnet RPC (market decoding, transaction verification)
+  - Solana mainnet RPC (market decoding, transaction verification, execution)
   - Jupiter `price/v3`, `tokens/v2/search`, `swap/v1/quote`, `swap/v1/swap` (routed quotes, real swap-transaction building)
   - Pyth Hermes (`hermes.pyth.network`) — real equity + xStock cross-check feeds (gated behind a feed-grant; degrades to an honest "pending" state until granted, never fabricated)
 

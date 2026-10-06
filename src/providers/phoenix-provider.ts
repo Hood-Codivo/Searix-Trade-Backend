@@ -1,4 +1,4 @@
-import { Client, type MarketState } from '@ellipsis-labs/phoenix-sdk';
+import { Client, Side, getMarketSwapTransaction, type MarketState } from '@ellipsis-labs/phoenix-sdk';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { CandleHistory } from '../domain/candle-history.js';
 import { recordTick } from '../domain/clickhouse.js';
@@ -10,9 +10,12 @@ import {
   type CandleRange,
   type MarketSnapshot,
   type OrderLevel,
+  type TradeSide,
 } from '../domain/market.js';
+import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction, getAssociatedTokenAddressSync } from '@solana/spl-token';
+import type { BuiltSwapTransaction } from './jupiter-swap-builder.js';
 import { JupiterReferenceClient } from './jupiter-reference-client.js';
-import type { MarketProvider, MarketUpdate } from './market-provider.js';
+import type { MarketProvider, MarketUpdate, SwapFeeTransfer } from './market-provider.js';
 
 // Only the mints we can label with confidence; anything else falls back to a shortened address
 // rather than guessing a ticker symbol.
@@ -26,6 +29,11 @@ function symbolForMint(mint: PublicKey): string {
   const key = mint.toBase58();
   return KNOWN_MINT_SYMBOLS[key] ?? `${key.slice(0, 4)}…${key.slice(-4)}`;
 }
+
+// The SDK default (0.5%) is tighter than the on-chain book can meet at small sizes: the IOC swap
+// fails its minimum-fill check by one lot. 2% clears it for the orders tested, and it still caps how
+// far the fill can move from the quoted price.
+export const PHOENIX_SWAP_SLIPPAGE = 0.02;
 
 export type PhoenixProviderConfig = {
   rpcUrl: string;
@@ -104,6 +112,51 @@ export class PhoenixProvider implements MarketProvider {
 
   getCandles(id: string, range: CandleRange): number[] | undefined {
     return this.candleHistory.getCandles(id, range);
+  }
+
+  // Builds an unsigned Phoenix swap transaction against the live on-chain book. `inAmount` is in
+  // whole tokens of the input side: quote (USDC) for a buy, base for a sell. Never signs anything.
+  async buildSwapTransaction(id: string, side: TradeSide, inAmount: number, trader: PublicKey, fee?: SwapFeeTransfer): Promise<BuiltSwapTransaction | null> {
+    const marketState = this.client?.marketStates.get(id);
+    if (!marketState) return null;
+    try {
+      const transaction = getMarketSwapTransaction({
+        market: marketState,
+        trader,
+        side: side === 'buy' ? Side.Bid : Side.Ask,
+        inAmount,
+        slippage: PHOENIX_SWAP_SLIPPAGE,
+        idempotent: true,
+      });
+      if (fee && fee.amountAtoms > 0n) {
+        // Fee leaves the trader's own input-mint account in the same atomic transaction, so a
+        // failed swap also reverts the fee. Classic SPL token: the crypto markets' mints use it.
+        const mint = new PublicKey(fee.mint);
+        const destination = new PublicKey(fee.destinationAccount);
+        transaction.add(createAssociatedTokenAccountIdempotentInstruction(trader, destination, new PublicKey(fee.owner), mint));
+        transaction.add(createTransferCheckedInstruction(
+          getAssociatedTokenAddressSync(mint, trader),
+          mint,
+          destination,
+          trader,
+          fee.amountAtoms,
+          fee.decimals,
+        ));
+      }
+      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = trader;
+      // Never hand back a swap the book can't fill: simulate it on-chain first. The SDK's minimum-fill
+      // check can disagree with what the live book matches at a given size, and a failed swap would
+      // otherwise only surface after the user has signed.
+      const simulation = await this.connection.simulateTransaction(transaction, undefined, true);
+      if (simulation.value.err) return null;
+
+      const transactionBase64 = transaction.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64');
+      return { transactionBase64, lastValidBlockHeight };
+    } catch {
+      return null;
+    }
   }
 
   private async refreshStats() {

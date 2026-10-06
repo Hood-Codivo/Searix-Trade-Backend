@@ -14,7 +14,6 @@ import { assetRegistry, getRegistryEntry } from './domain/registry.js';
 import type { MarketProvider } from './providers/market-provider.js';
 import { fetchJupiterSwapQuote } from './providers/jupiter-swap-quote.js';
 import { buildJupiterSwapTransaction } from './providers/jupiter-swap-builder.js';
-import { buildDevnetProbeTransaction } from './providers/devnet-transaction-builder.js';
 
 // Reports what a receipt/alert repository is actually backed by, rather than a hardcoded label --
 // keeps this honest as PostgresReceiptRepository/PostgresAlertRepository get added alongside the
@@ -40,7 +39,7 @@ const executionTransactionBody = z.object({
 });
 const executionConfirmBody = z.object({
   signature: z.string().min(32).max(128),
-  network: z.enum(['devnet', 'mainnet-beta']),
+  network: z.literal('mainnet-beta'),
   side: z.enum(['buy', 'sell']),
   amountUsd: z.number().finite().min(1).max(1_000_000),
   userPublicKey: z.string().min(32).max(64),
@@ -140,12 +139,6 @@ export async function createApp(
       return reply.code(400).send({ error: { code: 'INVALID_WALLET_ADDRESS', message: 'That is not a valid Solana wallet address.' } });
     }
 
-    if (executionConfig.network === 'devnet') {
-      const built = await buildDevnetProbeTransaction(body.data.userPublicKey, executionConfig.rpcUrls.devnet);
-      if (!built) return reply.code(502).send({ error: { code: 'TRANSACTION_BUILD_FAILED', message: 'Could not reach devnet to build a transaction right now.' } });
-      return { data: { ...built, network: 'devnet', kind: 'devnet-probe' } };
-    }
-
     if (!market.baseMint || !market.quoteMint || market.baseDecimals === undefined || market.quoteDecimals === undefined) {
       return reply.code(400).send({ error: { code: 'MARKET_NOT_EXECUTABLE', message: 'This market has no known on-chain mints to route a real swap.' } });
     }
@@ -157,6 +150,32 @@ export async function createApp(
       return reply.code(400).send({ error: { code: 'ORDER_BOOK_EMPTY', message: 'No live price is available for this market right now.' } });
     }
 
+    // Route selection: the same best-live-venue decision the quote shows. Phoenix wins when its
+    // on-chain book gives the better price; otherwise Jupiter. A failed Phoenix build is an error,
+    // not a silent switch to Jupiter, so the executed route always matches the quote the user saw.
+    const quote = await calculateExecutionQuote(market, body.data.side, body.data.amountUsd, feePolicy);
+    const bestVenue = quote.venueQuotes.find((row) => row.best)?.venue;
+    if (bestVenue === 'Phoenix') {
+      // Fee is taken from the input side: the user spends `grossInput`, of which `feeAtoms` go to
+      // the treasury and the rest is what the Phoenix swap actually trades.
+      const inputMintForFee = body.data.side === 'buy' ? market.quoteMint : market.baseMint;
+      const inputDecimalsForFee = body.data.side === 'buy' ? market.quoteDecimals : market.baseDecimals;
+      const grossInput = body.data.side === 'buy' ? body.data.amountUsd : requestedBase;
+      const grossAtoms = BigInt(Math.round(grossInput * 10 ** inputDecimalsForFee));
+      const feeBps = feePolicy.enabled && feePolicy.treasuryAddress ? feePolicy.standardFeeBps : 0;
+      const feeAtoms = grossAtoms * BigInt(feeBps) / 10_000n;
+      const netAtoms = grossAtoms - feeAtoms;
+      if (netAtoms <= 0n) return reply.code(400).send({ error: { code: 'AMOUNT_TOO_SMALL', message: 'That amount rounds to zero on-chain.' } });
+      const fee = feeAtoms > 0n && feePolicy.treasuryAddress
+        ? { mint: inputMintForFee!, decimals: inputDecimalsForFee!, amountAtoms: feeAtoms, owner: feePolicy.treasuryAddress, destinationAccount: deriveTreasuryFeeAccount(feePolicy.treasuryAddress, inputMintForFee!) }
+        : undefined;
+
+      const phoenixInAmount = Number(netAtoms) / 10 ** inputDecimalsForFee!;
+      const phoenixBuilt = await provider.buildSwapTransaction?.(market.id, body.data.side, phoenixInAmount, new PublicKey(body.data.userPublicKey), fee);
+      if (!phoenixBuilt) return reply.code(502).send({ error: { code: 'TRANSACTION_BUILD_FAILED', message: 'Phoenix cannot fill this order size on its current book. Try a different amount.' } });
+      return { data: { ...phoenixBuilt, network: 'mainnet-beta', kind: 'phoenix-swap', venue: 'Phoenix' } };
+    }
+
     const inputMint = body.data.side === 'buy' ? market.quoteMint : market.baseMint;
     const outputMint = body.data.side === 'buy' ? market.baseMint : market.quoteMint;
     const inputDecimals = body.data.side === 'buy' ? market.quoteDecimals : market.baseDecimals;
@@ -165,16 +184,16 @@ export async function createApp(
     if (inputAtoms <= 0n) return reply.code(400).send({ error: { code: 'AMOUNT_TOO_SMALL', message: 'That amount rounds to zero on-chain.' } });
 
     const platformFeeBps = feePolicy.enabled ? feePolicy.standardFeeBps : undefined;
-    const quote = await fetchJupiterSwapQuote(inputMint, outputMint, inputAtoms.toString(), platformFeeBps);
-    if (!quote) return reply.code(502).send({ error: { code: 'QUOTE_UNAVAILABLE', message: 'Could not get a live swap route for this trade right now.' } });
+    const swapQuote = await fetchJupiterSwapQuote(inputMint, outputMint, inputAtoms.toString(), platformFeeBps);
+    if (!swapQuote) return reply.code(502).send({ error: { code: 'QUOTE_UNAVAILABLE', message: 'Could not get a live swap route for this trade right now.' } });
 
     const feeAccount = feePolicy.enabled && feePolicy.treasuryAddress
       ? deriveTreasuryFeeAccount(feePolicy.treasuryAddress, outputMint)
       : undefined;
 
-    const built = await buildJupiterSwapTransaction({ quoteResponse: quote.raw, userPublicKey: body.data.userPublicKey, feeAccount });
+    const built = await buildJupiterSwapTransaction({ quoteResponse: swapQuote.raw, userPublicKey: body.data.userPublicKey, feeAccount });
     if (!built) return reply.code(502).send({ error: { code: 'TRANSACTION_BUILD_FAILED', message: 'Could not build a live swap transaction right now.' } });
-    return { data: { ...built, network: 'mainnet-beta', kind: 'jupiter-swap' } };
+    return { data: { ...built, network: 'mainnet-beta', kind: 'jupiter-swap', venue: 'Jupiter' } };
   });
 
   app.post('/v1/markets/:id/execution-confirm', async (request, reply) => {
@@ -198,7 +217,10 @@ export async function createApp(
       const outputMint = body.data.side === 'buy' ? market.baseMint : market.quoteMint;
       const inputDecimals = body.data.side === 'buy' ? market.quoteDecimals : market.baseDecimals;
       const outputDecimals = body.data.side === 'buy' ? market.baseDecimals : market.quoteDecimals;
-      const fill = extractTokenFill(verification.transaction, body.data.userPublicKey, inputMint, outputMint, inputDecimals, outputDecimals);
+      // Only a Phoenix swap pays the platform fee on the input mint; a Jupiter fee lands on the output
+      // mint, so the treasury-account match below never counts it against the input.
+      const feeAccountForFill = feePolicy.enabled && feePolicy.treasuryAddress ? deriveTreasuryFeeAccount(feePolicy.treasuryAddress, inputMint) : undefined;
+      const fill = extractTokenFill(verification.transaction, body.data.userPublicKey, inputMint, outputMint, inputDecimals, outputDecimals, feeAccountForFill);
       if (fill) {
         if (body.data.side === 'buy') {
           actualFilledUsd = round(fill.inputAmount);

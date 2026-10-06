@@ -113,7 +113,7 @@ export type ExecutionQuote = {
   }>;
 };
 
-export type ExecutionNetwork = 'devnet' | 'mainnet-beta';
+export type ExecutionNetwork = 'mainnet-beta';
 
 export type ExecutionReceipt = {
   id: string;
@@ -279,19 +279,23 @@ export async function calculateExecutionQuote(market: MarketSnapshot, side: Trad
   const combinedFees = feeUsd + (feePolicy.enabled ? phoenixFeeUsd : 0);
   const phoenixTotal = side === 'buy' ? filledUsd + combinedFees : filledUsd - combinedFees;
 
+  // Tokenized stocks have no real Phoenix book, so their Phoenix row is a simulated ladder and is
+  // marked not live -- it is shown for context but never chosen as the executable route.
   const venueQuotes: ExecutionQuote['venueQuotes'] = [
-    { venue: 'Phoenix', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(phoenixTotal), best: true, isLive: true },
+    { venue: 'Phoenix', averagePrice: round(averagePrice, 10), priceImpactBps: round(priceImpactBps, 1), estimatedTotalUsd: round(phoenixTotal), best: false, isLive: market.assetClass !== 'tokenized-stock' },
   ];
   const jupiterRow = await fetchRealJupiterComparison(market, side, requestedUsd, requestedBase, referencePrice);
   if (jupiterRow) venueQuotes.push(jupiterRow);
 
-  // Best = whichever real row gives the better price (lower per-unit cost on a buy, higher
+  // Best = whichever live row gives the better price (lower per-unit cost on a buy, higher
   // proceeds on a sell). Compares averagePrice, not estimatedTotalUsd -- the latter bakes in our
   // own platform fee for the Phoenix row but not Jupiter's, so it isn't a fair comparison.
-  const bestRow = venueQuotes.reduce((best, row) => {
+  const liveRows = venueQuotes.filter((row) => row.isLive);
+  const bestRow = liveRows.reduce<ExecutionQuote['venueQuotes'][number] | undefined>((best, row) => {
+    if (!best) return row;
     const better = side === 'buy' ? row.averagePrice < best.averagePrice : row.averagePrice > best.averagePrice;
     return better ? row : best;
-  });
+  }, undefined);
   for (const row of venueQuotes) row.best = row === bestRow;
 
   return {

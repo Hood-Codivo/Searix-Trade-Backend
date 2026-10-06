@@ -1,5 +1,6 @@
-import type { CandleRange, MarketSnapshot } from '../domain/market.js';
-import type { MarketProvider, MarketUpdate } from './market-provider.js';
+import type { PublicKey } from '@solana/web3.js';
+import type { CandleRange, MarketSnapshot, TradeSide } from '../domain/market.js';
+import type { MarketProvider, MarketUpdate, SwapFeeTransfer } from './market-provider.js';
 
 // Fans a single MarketProvider surface out over several underlying providers (e.g. live Phoenix
 // crypto markets + simulated tokenized-stock markets) with no ID collisions to worry about — real
@@ -44,5 +45,12 @@ export class CompositeMarketProvider implements MarketProvider {
       if (provider.get(id)) return provider.getCandles?.(id, range);
     }
     return undefined;
+  }
+
+  buildSwapTransaction(id: string, side: TradeSide, inAmount: number, trader: PublicKey, fee?: SwapFeeTransfer) {
+    for (const provider of this.providers) {
+      if (provider.get(id)) return provider.buildSwapTransaction?.(id, side, inAmount, trader, fee) ?? Promise.resolve(null);
+    }
+    return Promise.resolve(null);
   }
 }

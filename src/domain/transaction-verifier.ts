@@ -1,11 +1,11 @@
 import { Connection, type ParsedTransactionWithMeta } from '@solana/web3.js';
 
-export type Network = 'devnet' | 'mainnet-beta';
+export type Network = 'mainnet-beta';
 
-export type RpcUrls = { devnet: string; mainnet: string };
+export type RpcUrls = { mainnet: string };
 
 function connectionFor(network: Network, rpcUrls: RpcUrls): Connection {
-  return new Connection(network === 'devnet' ? rpcUrls.devnet : rpcUrls.mainnet, 'confirmed');
+  return new Connection(rpcUrls.mainnet, 'confirmed');
 }
 
 export type VerifiedTransaction = {
@@ -39,6 +39,7 @@ export function extractTokenFill(
   outputMint: string,
   inputDecimals: number,
   outputDecimals: number,
+  feeAccount?: string,
 ): { inputAmount: number; outputAmount: number } | null {
   const pre = tx.meta?.preTokenBalances ?? [];
   const post = tx.meta?.postTokenBalances ?? [];
@@ -54,5 +55,24 @@ export function extractTokenFill(
   const inputDelta = delta(inputMint, inputDecimals);
   const outputDelta = delta(outputMint, outputDecimals);
   if (!(inputDelta < 0) || !(outputDelta > 0)) return null;
-  return { inputAmount: Math.abs(inputDelta), outputAmount: outputDelta };
+
+  // A platform fee sent to the treasury on the input mint is part of the user's spend but not of
+  // the swap itself, so take it back out of the input amount the fill reports.
+  const feeAtoms = feeAccount ? transferredToAccount(tx, feeAccount, inputMint) : 0;
+  const swapInput = Math.abs(inputDelta) - feeAtoms / 10 ** inputDecimals;
+  if (!(swapInput > 0)) return null;
+  return { inputAmount: swapInput, outputAmount: outputDelta };
+}
+
+// Sums the top-level SPL transferChecked amounts (in atoms) sent to one token account for one mint.
+function transferredToAccount(tx: ParsedTransactionWithMeta, destination: string, mint: string): number {
+  let total = 0;
+  for (const instruction of tx.transaction.message.instructions) {
+    if (!('parsed' in instruction) || typeof instruction.parsed !== 'object') continue;
+    const parsed = instruction.parsed as { type?: string; info?: { destination?: string; mint?: string; tokenAmount?: { amount?: string } } };
+    if (parsed.type !== 'transferChecked') continue;
+    if (parsed.info?.destination !== destination || parsed.info?.mint !== mint) continue;
+    total += Number(parsed.info.tokenAmount?.amount ?? 0);
+  }
+  return total;
 }
