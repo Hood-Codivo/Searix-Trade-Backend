@@ -101,6 +101,8 @@ export type ExecutionQuote = {
   qualityScore: number;
   qualityLabel: 'Efficient' | 'Acceptable' | 'Expensive';
   warning: string | null;
+  // Best price on the side you are trading and how much base sits there: the depth you can actually hit first.
+  topOfBook: { price: number; size: number } | null;
   explanation: string;
   observedAt: string;
   venueQuotes: Array<{
@@ -278,8 +280,13 @@ export async function calculateExecutionQuote(market: MarketSnapshot, side: Trad
 
   const qualityScore = Math.max(0, Math.round(100 - priceImpactBps * 1.4 - market.spreadBps * 0.8 - (100 - fillPercent)));
   const qualityLabel = qualityScore >= 85 ? 'Efficient' : qualityScore >= 65 ? 'Acceptable' : 'Expensive';
+  // Real Phoenix books only: a tokenized stock's book is a simulated ladder, so its spread says nothing about liquidity.
+  const wideSpread = market.assetClass !== 'tokenized-stock' && market.spreadBps > 100;
+  const topLevel = levels[0];
   const warning = fillPercent < 99.9
     ? `Only ${round(fillPercent, 1)}% of this order is visible in the current book.`
+    : wideSpread
+      ? `Wide spread: the ${market.base}/${market.quote} book is ${round(market.spreadBps / 100, 1)}% apart and only ${round(topLevel?.size ?? 0, 3)} ${market.base} sits at the best price.`
     : priceImpactBps > 25
       ? `This order exceeds the 25 bps liquidity budget by ${round(priceImpactBps - 25, 1)} bps.`
       : null;
@@ -331,6 +338,7 @@ export async function calculateExecutionQuote(market: MarketSnapshot, side: Trad
     qualityScore,
     qualityLabel,
     warning,
+    topOfBook: topLevel ? { price: round(topLevel.price, 10), size: round(topLevel.size, 6) } : null,
     explanation,
     observedAt: market.observedAt,
     venueQuotes,
