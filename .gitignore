@@ -11,3 +11,6 @@ data/
 
 # Local secrets (payer keypairs). Never commit.
 secrets/
+
+# Not part of the running app.
+pitch-deck/
