@@ -1,14 +1,17 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { VersionedTransaction } from '@solana/web3.js';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { VersionedTransaction, type Connection } from '@solana/web3.js';
 import type { ExecutionQuote, MarketSnapshot } from './market.js';
+import { canonicalMessageHash } from './transaction-canonical.js';
 
 export type ExecutionIntent = {
   wallet: string; market: MarketSnapshot; quote: ExecutionQuote;
   messageHash: string; expires: number; feeAccount?: string;
 };
-export function messageHash(transactionBase64: string) {
+// Ignores recentBlockhash -- a wallet refreshing an about-to-expire blockhash before signing is normal
+// and must not fail confirmation later; any other change to the transaction still changes this hash.
+export function messageHash(transactionBase64: string, connection: Connection): Promise<string> {
   const tx = VersionedTransaction.deserialize(Buffer.from(transactionBase64, 'base64'));
-  return createHash('sha256').update(tx.message.serialize()).digest('hex');
+  return canonicalMessageHash(tx.message, connection);
 }
 export class ExecutionIntents {
   private readonly secret: Buffer;

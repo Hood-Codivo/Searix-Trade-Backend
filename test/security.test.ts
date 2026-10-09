@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { Keypair, PublicKey, SystemProgram, Transaction, type ParsedTransactionWithMeta } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, type ParsedTransactionWithMeta } from '@solana/web3.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -86,17 +86,28 @@ describe('wallet authentication and isolation', () => {
 });
 
 describe('execution integrity', () => {
-  it('rejects forged and expired execution tickets and hashes the entire message', () => {
-    const wallet = Keypair.generate(); const tx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: PublicKey.default.toBase58() }).add(SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: Keypair.generate().publicKey, lamports: 1 }));
+  it('rejects forged and expired execution tickets, ignores a refreshed blockhash, and still catches real tampering', async () => {
+    const wallet = Keypair.generate(); const recipient = Keypair.generate().publicKey;
+    const tx = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: PublicKey.default.toBase58() }).add(SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: recipient, lamports: 1 }));
     const encoded = tx.serialize({ requireAllSignatures: false }).toString('base64');
+    const connection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
     const intents = new ExecutionIntents('a'.repeat(32));
-    const token = intents.issue({ wallet: wallet.publicKey.toBase58(), market, quote, messageHash: messageHash(encoded) });
+    const token = intents.issue({ wallet: wallet.publicKey.toBase58(), market, quote, messageHash: await messageHash(encoded, connection) });
     assert.ok(intents.read(token));
     assert.equal(intents.read(`${token.split('.')[0]}x.${token.split('.')[1]}`), null);
     assert.equal(new ExecutionIntents('b'.repeat(32)).read(token), null);
     const now = Date.now; try { Date.now = () => now() + 25 * 3600_000; assert.equal(intents.read(token), null); } finally { Date.now = now; }
+
+    // A wallet refreshing an about-to-expire blockhash before signing is normal, safe behavior -- it
+    // must not make a genuine trade look tampered with.
     tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
-    assert.notEqual(messageHash(encoded), messageHash(tx.serialize({ requireAllSignatures: false }).toString('base64')));
+    const refreshedHash = await messageHash(tx.serialize({ requireAllSignatures: false }).toString('base64'), connection);
+    assert.equal(await messageHash(encoded, connection), refreshedHash);
+
+    // A real substitution -- a different amount -- must still change the hash and get caught.
+    const tampered = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: PublicKey.default.toBase58() }).add(SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: recipient, lamports: 2 }));
+    const tamperedHash = await messageHash(tampered.serialize({ requireAllSignatures: false }).toString('base64'), connection);
+    assert.notEqual(await messageHash(encoded, connection), tamperedHash);
   });
   it('rejects unrelated successful transactions, accepts a matching fill, and makes concurrent replay idempotent', async () => {
     const secret = process.env.EXECUTION_INTENT_SECRET;

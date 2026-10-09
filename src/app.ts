@@ -4,7 +4,7 @@ import Fastify from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { registerSecurity, addressSchema, ownReceipts, page } from './domain/security.js';
 import { ExecutionIntents, messageHash } from './domain/execution-intent.js';
-import { PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { z } from 'zod';
 import { calculateExecutionQuote, createExecutionReceipt, deriveReferenceAndBase, round, type CandleRange } from './domain/market.js';
 import { previewFeePolicy, type FeePolicy } from './domain/fee-policy.js';
@@ -90,6 +90,7 @@ export async function createApp(
   await registerSecurity(app);
   await app.register(websocket, { options: { maxPayload: 1024 } });
   const intents = new ExecutionIntents();
+  const mainnetConnection = new Connection(executionConfig.rpcUrls.mainnet, 'confirmed');
   app.setErrorHandler((caught, request, reply) => {
     const error = caught as { statusCode?: number; name?: string; code?: string };
     const status = typeof error.statusCode === 'number' && error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500;
@@ -215,7 +216,7 @@ export async function createApp(
       const phoenixBuilt = await provider.buildSwapTransaction?.(market.id, body.data.side, phoenixInAmount, new PublicKey(body.data.userPublicKey), fee);
       if (!phoenixBuilt) return reply.code(502).send({ error: { code: 'TRANSACTION_BUILD_FAILED', message: 'Phoenix cannot fill this order size on its current book. Try a different amount.' } });
       const executionIntent = intents.issue({ wallet: body.data.userPublicKey, market: { ...market, bids: [], asks: [], candles: [] }, quote,
-        messageHash: messageHash(phoenixBuilt.transactionBase64), feeAccount: fee?.destinationAccount });
+        messageHash: await messageHash(phoenixBuilt.transactionBase64, mainnetConnection), feeAccount: fee?.destinationAccount });
       return { data: { ...phoenixBuilt, executionIntent, network: 'mainnet-beta', kind: 'phoenix-swap', venue: 'Phoenix' } };
     }
 
@@ -245,7 +246,7 @@ export async function createApp(
     const check = await simulateBeforeSigning(built.transactionBase64, executionConfig.rpcUrls.mainnet);
     if (!check.ok) return reply.code(422).send({ error: { code: 'SIMULATION_FAILED', message: `This swap would fail on-chain: ${check.reason}` } });
     const executionIntent = intents.issue({ wallet: body.data.userPublicKey, market: { ...market, bids: [], asks: [], candles: [] }, quote,
-      messageHash: messageHash(built.transactionBase64), feeAccount });
+      messageHash: await messageHash(built.transactionBase64, mainnetConnection), feeAccount });
     return { data: { ...built, executionIntent, network: 'mainnet-beta', kind: 'jupiter-swap', venue: 'Jupiter' } };
   });
 

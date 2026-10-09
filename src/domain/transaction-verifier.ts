@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
 import { Connection, type ParsedTransactionWithMeta } from '@solana/web3.js';
+import { canonicalMessageHash } from './transaction-canonical.js';
 
 export type Network = 'mainnet-beta';
 
@@ -96,8 +96,11 @@ export function transferredToAccount(tx: ParsedTransactionWithMeta, destination:
 
 export async function transactionMessageHash(signature: string, rpcUrls: RpcUrls): Promise<string | null> {
   try {
-    const tx = await new Connection(rpcUrls.mainnet, 'confirmed').getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+    const connection = new Connection(rpcUrls.mainnet, 'confirmed');
+    const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
     if (!tx?.meta || tx.meta.err !== null) return null;
-    return createHash('sha256').update(tx.transaction.message.serialize()).digest('hex');
+    // Same canonicalization as the build-time hash: ignores recentBlockhash, so a wallet's routine
+    // blockhash refresh before signing doesn't make a genuine trade look tampered with.
+    return await canonicalMessageHash(tx.transaction.message, connection);
   } catch { return null; }
 }
