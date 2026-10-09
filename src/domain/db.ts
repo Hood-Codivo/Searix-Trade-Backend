@@ -4,14 +4,17 @@ const { Pool } = pg;
 
 let pool: pg.Pool | null = null;
 
-// Render's managed Postgres requires SSL for external connections; rejectUnauthorized is off
-// because Render's own cert chain isn't in Node's default trust store, a standard tradeoff for
-// platform-internal managed databases (the connection itself is still encrypted).
+// Verify remote TLS certificates. Set DATABASE_SSL_CA for a private certificate authority.
 export function getPool(): pg.Pool {
   if (pool) return pool;
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) throw new Error('DATABASE_URL is not set.');
-  pool = new Pool({ connectionString, ssl: { rejectUnauthorized: false } });
+  const url = new URL(connectionString);
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  // pg connection-string SSL settings can override the explicit verified TLS object.
+  for (const key of ['ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert']) url.searchParams.delete(key);
+  pool = new Pool({ connectionString: url.toString(), max: 10, connectionTimeoutMillis: 5_000, statement_timeout: 10_000,
+    ssl: local ? false : { rejectUnauthorized: true, ...(process.env.DATABASE_SSL_CA ? { ca: process.env.DATABASE_SSL_CA.split(String.raw`\n`).join('\n') } : {}) } });
   return pool;
 }
 

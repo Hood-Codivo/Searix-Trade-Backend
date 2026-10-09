@@ -6,7 +6,7 @@ import type { Pool } from 'pg';
 // avoids a hand-maintained column-per-field schema that has to be kept in sync with the TS type by
 // hand every time it changes.
 export class PostgresJsonbRepository<T extends { id: string; createdAt: string }> {
-  private migrated = false;
+  private ready: Promise<void> | null = null;
 
   constructor(
     private readonly pool: Pool,
@@ -16,8 +16,11 @@ export class PostgresJsonbRepository<T extends { id: string; createdAt: string }
     private readonly importFromFilePath?: string,
   ) {}
 
-  private async ensureReady() {
-    if (this.migrated) return;
+  private ensureReady(): Promise<void> {
+    if (!this.ready) this.ready = this.initialize().catch(error => { this.ready = null; throw error; });
+    return this.ready;
+  }
+  private async initialize() {
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS ${this.table} (
         id TEXT PRIMARY KEY,
@@ -26,8 +29,9 @@ export class PostgresJsonbRepository<T extends { id: string; createdAt: string }
       )
     `);
     await this.pool.query(`CREATE INDEX IF NOT EXISTS ${this.table}_created_at_idx ON ${this.table} (created_at DESC)`);
+    if (this.table === 'execution_receipts') await this.pool.query(`CREATE INDEX IF NOT EXISTS execution_receipts_signature_idx ON execution_receipts ((data->>'network'), (data->>'transactionSignature'))`);
     await this.importExistingFile();
-    this.migrated = true;
+
   }
 
   // One-time, idempotent (ON CONFLICT DO NOTHING keyed on id): if a local JSON file from the old
@@ -44,8 +48,8 @@ export class PostgresJsonbRepository<T extends { id: string; createdAt: string }
           [record.id, record.createdAt, JSON.stringify(record)],
         );
       }
-    } catch {
-      // No existing file, or it's unreadable -- nothing to import.
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
 
@@ -57,6 +61,24 @@ export class PostgresJsonbRepository<T extends { id: string; createdAt: string }
 
   async save(record: T): Promise<T> {
     await this.ensureReady();
+    // Serialize signature claims across all API replicas without deleting legacy records.
+    const execution = record as T & { transactionSignature?: string; network?: string };
+    if (this.table === 'execution_receipts' && execution.transactionSignature) {
+      const client = await this.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const key = `${execution.network}:${execution.transactionSignature}`;
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key]);
+        const existing = await client.query(
+          `SELECT data FROM execution_receipts WHERE data->>'network' = $1 AND data->>'transactionSignature' = $2 ORDER BY created_at ASC LIMIT 1`,
+          [execution.network, execution.transactionSignature],
+        );
+        if (existing.rows.length) { await client.query('COMMIT'); return existing.rows[0].data as T; }
+        await client.query(`INSERT INTO execution_receipts (id, created_at, data) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`, [record.id, record.createdAt, JSON.stringify(record)]);
+        await client.query('COMMIT'); return record;
+      } catch (error) { await client.query('ROLLBACK'); throw error; }
+      finally { client.release(); }
+    }
     await this.pool.query(
       `INSERT INTO ${this.table} (id, created_at, data) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`,
       [record.id, record.createdAt, JSON.stringify(record)],

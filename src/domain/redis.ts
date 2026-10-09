@@ -14,7 +14,7 @@ function getClient(): InstanceType<typeof Redis> | null {
     maxRetriesPerRequest: 1,
     lazyConnect: true,
   });
-  client.on('error', (error: Error) => console.error('redis client error', error.message));
+  client.on('error', (error: Error) => console.error('Redis connection error'));
   return client;
 }
 
@@ -30,7 +30,7 @@ export async function cached<T>(key: string, ttlSeconds: number, fetchFresh: () 
     const hit = await redis.get(key);
     if (hit) return JSON.parse(hit) as T;
   } catch (error) {
-    console.error('redis read failed, falling back to live fetch', error);
+    console.error('Redis read failed; falling back to live fetch');
   }
 
   const fresh = await fetchFresh();
@@ -38,7 +38,7 @@ export async function cached<T>(key: string, ttlSeconds: number, fetchFresh: () 
   try {
     if (redis.status === 'ready') await redis.set(key, JSON.stringify(fresh), 'EX', ttlSeconds);
   } catch (error) {
-    console.error('redis write failed (non-fatal)', error);
+    console.error('Redis cache write failed');
   }
 
   return fresh;

@@ -7,7 +7,7 @@ export type FeePolicy = {
 
 const parseBps = (value: string | undefined, fallback: number) => {
   const parsed = Number(value ?? fallback);
-  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 100 ? parsed : fallback;
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= 100 ? parsed : fallback;
 };
 
 export function feePolicyFromEnvironment(): FeePolicy {

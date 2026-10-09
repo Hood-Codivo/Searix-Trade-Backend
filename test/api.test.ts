@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
+import { Keypair } from '@solana/web3.js';
+import { login } from './security-helpers.js';
+import type { InjectOptions } from 'light-my-request';
 import { createApp } from '../src/app.js';
 import type { MarketSnapshot } from '../src/domain/market.js';
 import type { MarketProvider, MarketUpdate } from '../src/providers/market-provider.js';
@@ -46,18 +49,21 @@ class FixtureMarketProvider implements MarketProvider {
 
 let app: FastifyInstance;
 
-before(async () => { app = await createApp(new FixtureMarketProvider()); });
+const wallet = Keypair.generate();
+let headers: { authorization: string };
+async function inject(options: InjectOptions) { return app.inject({ ...options, headers }); }
+before(async () => { app = await createApp(new FixtureMarketProvider()); headers = (await login(app, wallet)).headers; });
 after(async () => { await app.close(); });
 
 describe('market API', () => {
   it('reports provider health', async () => {
-    const response = await app.inject({ method: 'GET', url: '/health' });
+    const response = await inject({ method: 'GET', url: '/health' });
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().provider, 'connected');
   });
 
   it('lists normalized markets', async () => {
-    const response = await app.inject({ method: 'GET', url: '/v1/markets' });
+    const response = await inject({ method: 'GET', url: '/v1/markets' });
     const body = response.json();
     assert.equal(response.statusCode, 200);
     assert.equal(body.data.length, 5);
@@ -67,8 +73,8 @@ describe('market API', () => {
 
   it('returns market depth and quality', async () => {
     const [book, quality] = await Promise.all([
-      app.inject({ method: 'GET', url: '/v1/markets/sol-usdc/orderbook' }),
-      app.inject({ method: 'GET', url: '/v1/markets/sol-usdc/quality' }),
+      inject({ method: 'GET', url: '/v1/markets/sol-usdc/orderbook' }),
+      inject({ method: 'GET', url: '/v1/markets/sol-usdc/quality' }),
     ]);
     assert.equal(book.statusCode, 200);
     assert.ok(book.json().data.bids.length > 0);
@@ -77,13 +83,13 @@ describe('market API', () => {
   });
 
   it('returns a stable 404 error contract', async () => {
-    const response = await app.inject({ method: 'GET', url: '/v1/markets/missing' });
+    const response = await inject({ method: 'GET', url: '/v1/markets/missing' });
     assert.equal(response.statusCode, 404);
     assert.equal(response.json().error.code, 'MARKET_NOT_FOUND');
   });
 
   it('quotes a buy execution against the book', async () => {
-    const response = await app.inject({ method: 'POST', url: '/v1/markets/sol-usdc/execution-quote', payload: { side: 'buy', amountUsd: 100 } });
+    const response = await inject({ method: 'POST', url: '/v1/markets/sol-usdc/execution-quote', payload: { side: 'buy', amountUsd: 100 } });
     const body = response.json().data;
     assert.equal(response.statusCode, 200);
     assert.equal(body.marketId, 'sol-usdc');
@@ -94,13 +100,13 @@ describe('market API', () => {
   });
 
   it('rejects an execution-quote with an invalid amount', async () => {
-    const response = await app.inject({ method: 'POST', url: '/v1/markets/sol-usdc/execution-quote', payload: { side: 'buy', amountUsd: 0 } });
+    const response = await inject({ method: 'POST', url: '/v1/markets/sol-usdc/execution-quote', payload: { side: 'buy', amountUsd: 0 } });
     assert.equal(response.statusCode, 400);
     assert.equal(response.json().error.code, 'INVALID_EXECUTION_REQUEST');
   });
 
   it('saves and lists an execution receipt with a benchmark price for a tokenized-stock market', async () => {
-    const saveResponse = await app.inject({ method: 'POST', url: '/v1/markets/aaplx-usdc/execution-receipts', payload: { side: 'buy', amountUsd: 5_000 } });
+    const saveResponse = await inject({ method: 'POST', url: '/v1/markets/aaplx-usdc/execution-receipts', payload: { side: 'buy', amountUsd: 5_000 } });
     const saved = saveResponse.json().data;
     assert.equal(saveResponse.statusCode, 201);
     assert.equal(saved.verified, false);
@@ -108,7 +114,7 @@ describe('market API', () => {
     assert.ok(saved.benchmarkPrice > 0);
     assert.ok(typeof saved.contentHash === 'string' && saved.contentHash.length === 64);
 
-    const listResponse = await app.inject({ method: 'GET', url: '/v1/execution-receipts' });
+    const listResponse = await inject({ method: 'GET', url: '/v1/execution-receipts' });
     const listed = listResponse.json();
     assert.equal(listResponse.statusCode, 200);
     assert.equal(listed.data.length, 1);
@@ -116,10 +122,10 @@ describe('market API', () => {
   });
 
   it('reports fee config and a revenue summary derived from saved receipts', async () => {
-    const fees = await app.inject({ method: 'GET', url: '/v1/fees/config' });
+    const fees = await inject({ method: 'GET', url: '/v1/fees/config' });
     assert.equal(fees.json().data.collectionEnabled, false);
 
-    const revenue = await app.inject({ method: 'GET', url: '/v1/revenue/summary' });
+    const revenue = await inject({ method: 'GET', url: '/v1/revenue/summary' });
     const body = revenue.json().data;
     assert.equal(body.receiptCount, 1);
     assert.ok(body.projectedRevenueUsd > 0);
@@ -127,78 +133,79 @@ describe('market API', () => {
   });
 
   it('lists alerts (none raised, since the fixture provider never emits updates)', async () => {
-    const response = await app.inject({ method: 'GET', url: '/v1/alerts' });
+    const response = await inject({ method: 'GET', url: '/v1/alerts' });
     assert.equal(response.statusCode, 200);
     assert.deepEqual(response.json().data, []);
   });
 
   it('refuses to build a swap for a market with no on-chain mints', async () => {
-    const response = await app.inject({
+    const response = await inject({
       method: 'POST',
       url: '/v1/markets/sol-usdc/execution-transaction',
-      payload: { side: 'buy', amountUsd: 10, userPublicKey: '11111111111111111111111111111111' },
+      payload: { side: 'buy', amountUsd: 10, userPublicKey: wallet.publicKey.toBase58() },
     });
     assert.equal(response.statusCode, 400);
     assert.equal(response.json().error.code, 'MARKET_NOT_EXECUTABLE');
   });
 
   it('rejects execution-transaction requests that exceed the server-side USD cap', async () => {
-    const response = await app.inject({
+    const response = await inject({
       method: 'POST',
       url: '/v1/markets/sol-usdc/execution-transaction',
-      payload: { side: 'buy', amountUsd: 10_000, userPublicKey: '11111111111111111111111111111111' },
+      payload: { side: 'buy', amountUsd: 10_000, userPublicKey: wallet.publicKey.toBase58() },
     });
     assert.equal(response.statusCode, 400);
     assert.equal(response.json().error.code, 'AMOUNT_EXCEEDS_LIMIT');
   });
 
   it('rejects execution-transaction requests with an invalid wallet address', async () => {
-    const response = await app.inject({
+    const response = await inject({
       method: 'POST',
       url: '/v1/markets/sol-usdc/execution-transaction',
       payload: { side: 'buy', amountUsd: 10, userPublicKey: '0'.repeat(44) },
     });
-    assert.equal(response.statusCode, 400);
-    assert.equal(response.json().error.code, 'INVALID_WALLET_ADDRESS');
+    assert.equal(response.statusCode, 403);
+    assert.equal(response.json().error.code, 'WALLET_MISMATCH');
   });
 
-  it('never marks a receipt verified for a signature that does not resolve on-chain', async () => {
-    const response = await app.inject({
+  it('rejects confirmation without a valid prepared intent', async () => {
+    const response = await inject({
       method: 'POST',
       url: '/v1/markets/sol-usdc/execution-confirm',
       payload: {
+        executionIntent: 'invalid',
         signature: '1'.repeat(88),
         network: 'mainnet-beta',
         side: 'buy',
         amountUsd: 10,
-        userPublicKey: '11111111111111111111111111111111',
+        userPublicKey: wallet.publicKey.toBase58(),
       },
     });
     assert.equal(response.statusCode, 422);
-    assert.equal(response.json().error.code, 'TRANSACTION_NOT_VERIFIED');
+    assert.equal(response.json().error.code, 'INVALID_EXECUTION_INTENT');
   });
 
   it('rejects a malformed execution-confirm request', async () => {
-    const response = await app.inject({
+    const response = await inject({
       method: 'POST',
       url: '/v1/markets/sol-usdc/execution-confirm',
-      payload: { signature: 'too-short', network: 'mainnet-beta', side: 'buy', amountUsd: 10, userPublicKey: '11111111111111111111111111111111' },
+      payload: { signature: 'too-short', network: 'mainnet-beta', side: 'buy', amountUsd: 10, userPublicKey: wallet.publicKey.toBase58() },
     });
     assert.equal(response.statusCode, 400);
     assert.equal(response.json().error.code, 'INVALID_CONFIRM_REQUEST');
   });
 
   it('returns the verified asset registry and a single entry by symbol', async () => {
-    const list = await app.inject({ method: 'GET', url: '/v1/registry' });
+    const list = await inject({ method: 'GET', url: '/v1/registry' });
     assert.equal(list.statusCode, 200);
     assert.ok(list.json().data.length >= 3);
 
-    const entry = await app.inject({ method: 'GET', url: '/v1/registry/AAPLX' });
+    const entry = await inject({ method: 'GET', url: '/v1/registry/AAPLX' });
     assert.equal(entry.statusCode, 200);
     assert.equal(entry.json().data.symbol, 'AAPLX');
     assert.ok(entry.json().data.sources.length > 0);
 
-    const missing = await app.inject({ method: 'GET', url: '/v1/registry/NOTREAL' });
+    const missing = await inject({ method: 'GET', url: '/v1/registry/NOTREAL' });
     assert.equal(missing.statusCode, 404);
     assert.equal(missing.json().error.code, 'ASSET_NOT_FOUND');
   });

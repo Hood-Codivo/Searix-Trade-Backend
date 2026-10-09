@@ -14,7 +14,7 @@ export class PegAlertMonitor {
   ) {}
 
   start() {
-    this.unsubscribe = this.provider.subscribe((event) => void this.handleUpdate(event));
+    this.unsubscribe = this.provider.subscribe((event) => void this.handleUpdate(event).catch(() => { console.error('Peg alert persistence failed'); }));
   }
 
   stop() {

@@ -1,54 +1,27 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
 import type { ExecutionReceipt } from './market.js';
+import { JsonStore } from './json-store.js';
 
 export interface ReceiptRepository {
   list(): Promise<ExecutionReceipt[]>;
   save(receipt: ExecutionReceipt): Promise<ExecutionReceipt>;
 }
-
+export function sameExecution(a: ExecutionReceipt, b: ExecutionReceipt) {
+  return Boolean(a.transactionSignature && a.transactionSignature === b.transactionSignature && a.network === b.network);
+}
+function insert(rows: ExecutionReceipt[], receipt: ExecutionReceipt) {
+  const existing = rows.find(row => row.id === receipt.id || sameExecution(row, receipt));
+  if (existing) return existing;
+  if (rows.length >= 50_000) throw new Error('Receipt storage capacity reached. Archive receipts or use Postgres.');
+  rows.unshift(structuredClone(receipt)); return receipt;
+}
 export class InMemoryReceiptRepository implements ReceiptRepository {
   private readonly receipts: ExecutionReceipt[] = [];
-
-  async list() { return this.receipts.map((receipt) => structuredClone(receipt)); }
-
-  async save(receipt: ExecutionReceipt) {
-    this.receipts.unshift(structuredClone(receipt));
-    return structuredClone(receipt);
-  }
+  async list() { return structuredClone(this.receipts); }
+  async save(receipt: ExecutionReceipt) { return structuredClone(insert(this.receipts, receipt)); }
 }
-
-// Backed by a local JSON file so receipts survive a process restart, unlike InMemoryReceiptRepository.
 export class FileReceiptRepository implements ReceiptRepository {
-  private receipts: ExecutionReceipt[] | null = null;
-
-  constructor(private readonly filePath: string) {}
-
-  private async ensureLoaded() {
-    if (this.receipts) return this.receipts;
-    try {
-      const raw = await readFile(this.filePath, 'utf8');
-      this.receipts = JSON.parse(raw) as ExecutionReceipt[];
-    } catch {
-      this.receipts = [];
-    }
-    return this.receipts;
-  }
-
-  private async persist() {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(this.receipts, null, 2), 'utf8');
-  }
-
-  async list() {
-    const receipts = await this.ensureLoaded();
-    return receipts.map((receipt) => structuredClone(receipt));
-  }
-
-  async save(receipt: ExecutionReceipt) {
-    const receipts = await this.ensureLoaded();
-    receipts.unshift(structuredClone(receipt));
-    await this.persist();
-    return structuredClone(receipt);
-  }
+  private readonly store: JsonStore<ExecutionReceipt>;
+  constructor(filePath: string) { this.store = new JsonStore(filePath); }
+  list() { return this.store.list(); }
+  save(receipt: ExecutionReceipt) { return this.store.mutate(rows => insert(rows, receipt)); }
 }

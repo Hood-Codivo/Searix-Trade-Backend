@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { FeePolicy } from './fee-policy.js';
 import { fetchJupiterSwapQuote } from '../providers/jupiter-swap-quote.js';
 
@@ -154,6 +154,7 @@ export type ExecutionReceipt = {
 // Passed to createExecutionReceipt only once a real on-chain transaction has been verified --
 // never constructed from client-claimed values, only from what transaction-verifier.ts observed.
 export type ExecutionResult = {
+  feeCollected?: boolean;
   verified: boolean;
   transactionSignature: string;
   network: ExecutionNetwork;
@@ -345,7 +346,7 @@ export async function calculateExecutionQuote(market: MarketSnapshot, side: Trad
   };
 }
 
-export function createExecutionReceipt(market: MarketSnapshot, quote: ExecutionQuote, execution?: ExecutionResult): ExecutionReceipt {
+export function createExecutionReceipt(market: MarketSnapshot, quote: ExecutionQuote, execution?: Partial<ExecutionResult>): ExecutionReceipt {
   const bestVenue = quote.venueQuotes.find((venue) => venue.best)?.venue ?? market.venue;
   const evidence = {
     createdAt: new Date().toISOString(),
@@ -375,12 +376,12 @@ export function createExecutionReceipt(market: MarketSnapshot, quote: ExecutionQ
 
   // "Collected" only when a real mainnet transaction verified with fee collection turned on at
   // quote time -- never inferred, since this is exactly the claim the business model rests on.
-  const feeStatus = execution?.verified && execution.network === 'mainnet-beta' && quote.feeBreakdown.collectionEnabled
+  const feeStatus = execution?.verified && execution.network === 'mainnet-beta' && execution.feeCollected === true
     ? 'collected'
     : 'projected';
 
   return {
-    id: `pxr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    id: execution?.verified && execution.transactionSignature ? `tx_mainnet_${execution.transactionSignature}` : `pxr_${randomUUID()}`,
     ...evidence,
     feeStatus,
     contentHash,

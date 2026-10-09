@@ -10,6 +10,7 @@ import { CompositeMarketProvider } from "./providers/composite-market-provider.j
 import type { MarketProvider } from "./providers/market-provider.js";
 import { PegAlertMonitor } from "./providers/peg-alert-monitor.js";
 import { AlertRuleMonitor, FileAlertRuleStore } from "./domain/alert-rules.js";
+import { FilePushTokenStore } from "./domain/push-tokens.js";
 import { PhoenixProvider } from "./providers/phoenix-provider.js";
 import { TokenizedStockProvider } from "./providers/tokenized-stock-provider.js";
 
@@ -46,11 +47,14 @@ const alerts: AlertRepository = isDatabaseConfigured()
   ? new PostgresAlertRepository(alertsFilePath)
   : new FileAlertRepository(alertsFilePath);
 const alertRules = new FileAlertRuleStore("data/alert-rules.json");
-const app = await createApp(provider, receipts, feePolicyFromEnvironment(), alerts, executionConfigFromEnvironment(), alertRules);
+const pushTokens = new FilePushTokenStore("data/push-tokens.json");
+// Shares one pushTokens instance with the monitor below -- a separate instance would cache its own
+// (possibly empty) copy of the file and never see a token registered through the API.
+const app = await createApp(provider, receipts, feePolicyFromEnvironment(), alerts, executionConfigFromEnvironment(), alertRules, undefined, pushTokens);
 
 const pegAlertMonitor = new PegAlertMonitor(provider, alerts);
 pegAlertMonitor.start();
-const alertRuleMonitor = new AlertRuleMonitor(provider, alertRules, alerts);
+const alertRuleMonitor = new AlertRuleMonitor(provider, alertRules, alerts, pushTokens);
 alertRuleMonitor.start();
 app.addHook("onClose", async () => { pegAlertMonitor.stop(); alertRuleMonitor.stop(); });
 

@@ -46,7 +46,11 @@ optional. At minimum you need `SOLANA_RPC_URL` and `PHOENIX_MARKET_IDS` for live
 
 **Production infrastructure**
 
-- Authentication, rate limiting, a restricted production CORS allowlist (currently allows all origins)
+- Shared authentication/rate-limit storage before scaling to multiple API replicas (the current hardened implementation is single-process).
 - Receipt hash verification endpoint (let anyone independently confirm a saved receipt's `contentHash` wasn't altered after the fact)
 - CI/CD, provider failover, secrets management, a full security review
 - Corporate-action monitoring (dividends, splits, custodian changes, suspensions) — needs a verified real data source before it can be committed to; not yet researched.
+
+## Security and coordinated rollout
+
+See [SECURITY.md](SECURITY.md) for the audit findings, fixes, remaining dependency advisories, and rollout requirements. The mobile app and API security update must be released together. Production requires `EXECUTION_INTENT_SECRET`; do not deploy this backend against an old app build. Use Node 22.18+ for the test tooling.

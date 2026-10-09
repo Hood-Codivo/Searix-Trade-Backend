@@ -21,7 +21,9 @@ function getClient(): ClickHouseClient {
 }
 
 function targetDatabase(): string {
-  return process.env.CLICKHOUSE_DATABASE || 'default';
+  const name = process.env.CLICKHOUSE_DATABASE || 'default';
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error('Invalid ClickHouse database name');
+  return name;
 }
 
 async function ensureReady(): Promise<void> {
@@ -60,6 +62,6 @@ export async function recordTick(marketId: string, price: number, observedAt = n
       format: 'JSONEachRow',
     });
   } catch (error) {
-    console.error('clickhouse recordTick failed', error);
+    console.error('ClickHouse tick persistence failed');
   }
 }

@@ -13,8 +13,10 @@ export type HoldingRow = {
 // Executed, verified trades for one wallet, newest first. Analysis-only receipts never count:
 // they have no on-chain transaction behind them.
 export function executedTradesFor(all: ExecutionReceipt[], walletAddress: string): ExecutionReceipt[] {
+  const seen = new Set<string>();
   return all
     .filter((receipt) => receipt.walletAddress === walletAddress && receipt.status === 'executed' && receipt.verified)
+    .filter(receipt => { const key = receipt.transactionSignature ? `${receipt.network}:${receipt.transactionSignature}` : receipt.id; if (seen.has(key)) return false; seen.add(key); return true; })
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 

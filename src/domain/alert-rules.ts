@@ -1,8 +1,9 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { JsonStore } from './json-store.js';
 import type { Alert } from './alert.js';
 import type { MarketSnapshot } from './market.js';
 import type { AlertRepository } from './alert-repository.js';
+import type { FilePushTokenStore } from './push-tokens.js';
+import { sendPushNotification } from './push.js';
 import type { MarketProvider, MarketUpdate } from '../providers/market-provider.js';
 
 // A threshold a user set for one market: fires when the price, or the premium over the underlying share,
@@ -32,45 +33,25 @@ export function ruleMatches(rule: AlertRule, market: MarketSnapshot): boolean {
 
 // Same file-backed pattern as the other repositories -- rules survive a restart.
 export class FileAlertRuleStore {
-  private rules: AlertRule[] | null = null;
-
-  constructor(private readonly filePath: string) {}
-
-  private async ensureLoaded() {
-    if (this.rules) return this.rules;
-    try {
-      this.rules = JSON.parse(await readFile(this.filePath, 'utf8')) as AlertRule[];
-    } catch {
-      this.rules = [];
-    }
-    return this.rules;
-  }
-
-  private async persist() {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(this.rules, null, 2), 'utf8');
-  }
-
+  private readonly store: JsonStore<AlertRule>;
+  constructor(filePath: string) { this.store = new JsonStore(filePath); }
   async list(walletAddress?: string) {
-    const rules = await this.ensureLoaded();
-    return rules.filter((rule) => !walletAddress || rule.walletAddress === walletAddress).map((rule) => structuredClone(rule));
+    return (await this.store.list()).filter(rule => !walletAddress || rule.walletAddress === walletAddress);
   }
-
-  async add(rule: AlertRule) {
-    const rules = await this.ensureLoaded();
-    rules.push(structuredClone(rule));
-    await this.persist();
-    return structuredClone(rule);
+  add(rule: AlertRule) {
+    return this.store.mutate(rows => {
+      if (rows.length >= 10_000 || rows.filter(row => row.walletAddress === rule.walletAddress).length >= 100) {
+        throw Object.assign(new Error('Alert rule limit reached'), { statusCode: 429 });
+      }
+      rows.push(structuredClone(rule)); return rule;
+    });
   }
-
-  // Removes only the owner's rule; anyone else asking gets false and nothing changes.
-  async remove(id: string, walletAddress: string) {
-    const rules = await this.ensureLoaded();
-    const index = rules.findIndex((rule) => rule.id === id && rule.walletAddress === walletAddress);
-    if (index < 0) return false;
-    rules.splice(index, 1);
-    await this.persist();
-    return true;
+  remove(id: string, walletAddress: string) {
+    return this.store.mutate(rows => {
+      const index = rows.findIndex(rule => rule.id === id && rule.walletAddress === walletAddress);
+      if (index < 0) return false;
+      rows.splice(index, 1); return true;
+    });
   }
 }
 
@@ -83,10 +64,11 @@ export class AlertRuleMonitor {
     private readonly provider: MarketProvider,
     private readonly store: FileAlertRuleStore,
     private readonly alerts: AlertRepository,
+    private readonly pushTokens?: FilePushTokenStore,
   ) {}
 
   start() {
-    this.unsubscribe = this.provider.subscribe((event: MarketUpdate) => void this.handle(event.market));
+    this.unsubscribe = this.provider.subscribe((event: MarketUpdate) => void this.handle(event.market).catch(() => { console.error('Alert rule processing failed'); }));
   }
 
   stop() {
@@ -117,6 +99,10 @@ export class AlertRuleMonitor {
         message: `${market.base} ${rule.kind === 'price' ? 'price' : 'premium'} is ${rule.direction === 'above' ? 'at or above' : 'at or below'} ${rule.threshold}${unit} (now ${value === null ? 'unavailable' : `${round(value)}${unit}`}).`,
       };
       await this.alerts.save({ ...alert, id: `alr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`, createdAt: new Date().toISOString() });
+      if (this.pushTokens) {
+        const tokens = await this.pushTokens.tokensFor(rule.walletAddress);
+        void sendPushNotification(tokens, `${market.base} alert`, alert.message, { marketId: market.id });
+      }
     }
   }
 }

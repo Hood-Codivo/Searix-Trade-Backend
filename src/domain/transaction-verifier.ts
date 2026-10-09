@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Connection, type ParsedTransactionWithMeta } from '@solana/web3.js';
 
 export type Network = 'mainnet-beta';
@@ -21,7 +22,7 @@ export async function verifyTransactionSucceeded(signature: string, network: Net
   try {
     const connection = connectionFor(network, rpcUrls);
     const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
-    if (!tx || tx.meta?.err) return { success: false, slot: null, transaction: null };
+    if (!tx || !tx.meta || tx.meta.err !== null) return { success: false, slot: null, transaction: null };
     return { success: true, slot: tx.slot, transaction: tx };
   } catch {
     return { success: false, slot: null, transaction: null };
@@ -44,12 +45,28 @@ export function extractTokenFill(
   const pre = tx.meta?.preTokenBalances ?? [];
   const post = tx.meta?.postTokenBalances ?? [];
 
+  const nativeMint = 'So11111111111111111111111111111111111111112';
+  const nativeChange = () => {
+    const ownerIndex = tx.transaction.message.accountKeys.findIndex(key => key.pubkey.toBase58() === ownerAddress);
+    if (ownerIndex < 0 || !tx.meta) return 0;
+    let lamports = (tx.meta.postBalances[ownerIndex] ?? 0) - (tx.meta.preBalances[ownerIndex] ?? 0);
+    if (ownerIndex === 0) lamports += tx.meta.fee;
+    // Normalize token-account rent, including temporary wrapped-SOL accounts that are closed.
+    for (const index of new Set([...pre, ...post].map(entry => entry.accountIndex))) {
+      const before = pre.find(entry => entry.accountIndex === index);
+      const after = post.find(entry => entry.accountIndex === index);
+      const preRent = before ? (tx.meta.preBalances[index] ?? 0) - (before.mint === nativeMint ? Number(before.uiTokenAmount.amount) : 0) : 0;
+      const postRent = after ? (tx.meta.postBalances[index] ?? 0) - (after.mint === nativeMint ? Number(after.uiTokenAmount.amount) : 0) : 0;
+      lamports += postRent - preRent;
+    }
+    return lamports / 1e9;
+  };
   const delta = (mint: string, decimals: number): number => {
-    const preEntry = pre.find((b) => b.owner === ownerAddress && b.mint === mint);
-    const postEntry = post.find((b) => b.owner === ownerAddress && b.mint === mint);
-    const preAtoms = preEntry ? Number(preEntry.uiTokenAmount.amount) : 0;
-    const postAtoms = postEntry ? Number(postEntry.uiTokenAmount.amount) : 0;
-    return (postAtoms - preAtoms) / 10 ** decimals;
+    const sum = (entries: typeof pre) => entries.filter(b => b.owner === ownerAddress && b.mint === mint)
+      .reduce((total, entry) => total + BigInt(entry.uiTokenAmount.amount), 0n);
+    const change = sum(post) - sum(pre);
+    if (change > BigInt(Number.MAX_SAFE_INTEGER) || change < -BigInt(Number.MAX_SAFE_INTEGER)) return NaN;
+    return Number(change) / 10 ** decimals + (mint === nativeMint ? nativeChange() : 0);
   };
 
   const inputDelta = delta(inputMint, inputDecimals);
@@ -65,9 +82,9 @@ export function extractTokenFill(
 }
 
 // Sums the top-level SPL transferChecked amounts (in atoms) sent to one token account for one mint.
-function transferredToAccount(tx: ParsedTransactionWithMeta, destination: string, mint: string): number {
+export function transferredToAccount(tx: ParsedTransactionWithMeta, destination: string, mint: string): number {
   let total = 0;
-  for (const instruction of tx.transaction.message.instructions) {
+  for (const instruction of [...tx.transaction.message.instructions, ...(tx.meta?.innerInstructions ?? []).flatMap(group => group.instructions)]) {
     if (!('parsed' in instruction) || typeof instruction.parsed !== 'object') continue;
     const parsed = instruction.parsed as { type?: string; info?: { destination?: string; mint?: string; tokenAmount?: { amount?: string } } };
     if (parsed.type !== 'transferChecked') continue;
@@ -75,4 +92,12 @@ function transferredToAccount(tx: ParsedTransactionWithMeta, destination: string
     total += Number(parsed.info.tokenAmount?.amount ?? 0);
   }
   return total;
+}
+
+export async function transactionMessageHash(signature: string, rpcUrls: RpcUrls): Promise<string | null> {
+  try {
+    const tx = await new Connection(rpcUrls.mainnet, 'confirmed').getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+    if (!tx?.meta || tx.meta.err !== null) return null;
+    return createHash('sha256').update(tx.transaction.message.serialize()).digest('hex');
+  } catch { return null; }
 }

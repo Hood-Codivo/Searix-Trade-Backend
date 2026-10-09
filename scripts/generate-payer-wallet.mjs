@@ -10,6 +10,6 @@ if (existsSync(path)) {
   process.exit(1);
 }
 const keypair = Keypair.generate();
-writeFileSync(path, JSON.stringify(Array.from(keypair.secretKey)), { mode: 0o600 });
+writeFileSync(path, JSON.stringify(Array.from(keypair.secretKey)), { mode: 0o600, flag: 'wx' });
 console.log(`Keypair written to ${path}`);
 console.log(`Public address: ${keypair.publicKey.toBase58()}`);
