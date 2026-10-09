@@ -87,6 +87,13 @@ export async function createApp(
     logger: process.env.NODE_ENV === 'test' ? false : { redact: ['req.headers.authorization', 'req.body.signature', 'req.body.executionIntent'] } });
   const origins = (process.env.CORS_ORIGINS ?? 'https://searixtrade.com,https://www.searixtrade.com').split(',').map(value => value.trim()).filter(Boolean);
   await app.register(cors, { origin: origins, methods: ['GET', 'POST', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] });
+  // A client declaring "Content-Type: application/json" on a request with no body (a bodyless DELETE,
+  // for example) is a common, harmless mistake -- Fastify's default parser rejects it as invalid JSON.
+  // Treat an empty body as "no body" instead of failing the whole request over it.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
+    if (typeof body === 'string' && body.trim() === '') { done(null, undefined); return; }
+    try { done(null, JSON.parse(body as string)); } catch (error) { done(error as Error, undefined); }
+  });
   await registerSecurity(app);
   await app.register(websocket, { options: { maxPayload: 1024 } });
   const intents = new ExecutionIntents();
