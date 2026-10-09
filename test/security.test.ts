@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, type ParsedTransactionWithMeta } from '@solana/web3.js';
+import { ComputeBudgetProgram, Connection, Keypair, PublicKey, SystemProgram, Transaction, type ParsedTransactionWithMeta } from '@solana/web3.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -108,6 +108,14 @@ describe('execution integrity', () => {
     const tampered = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: PublicKey.default.toBase58() }).add(SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: recipient, lamports: 2 }));
     const tamperedHash = await messageHash(tampered.serialize({ requireAllSignatures: false }).toString('base64'), connection);
     assert.notEqual(await messageHash(encoded, connection), tamperedHash);
+
+    // Many wallets automatically add or adjust a priority-fee instruction before signing -- normal,
+    // automatic behavior that can't move funds. It must not make a genuine trade look tampered with.
+    const withPriorityFee = new Transaction({ feePayer: wallet.publicKey, recentBlockhash: PublicKey.default.toBase58() })
+      .add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }))
+      .add(SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: recipient, lamports: 1 }));
+    const priorityFeeHash = await messageHash(withPriorityFee.serialize({ requireAllSignatures: false }).toString('base64'), connection);
+    assert.equal(await messageHash(encoded, connection), priorityFeeHash);
   });
   it('rejects unrelated successful transactions, accepts a matching fill, and makes concurrent replay idempotent', async () => {
     const secret = process.env.EXECUTION_INTENT_SECRET;
