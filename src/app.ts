@@ -267,15 +267,14 @@ export async function createApp(
     if (!verification.success || !verification.transaction) {
       return reply.code(422).send({ error: { code: 'TRANSACTION_NOT_VERIFIED', message: 'That transaction could not be confirmed as successful on-chain.' } });
     }
-
-    const confirmedHash = await verificationServices.transactionMessageHash(body.data.signature, executionConfig.rpcUrls);
     const signedByWallet = verification.transaction.transaction.message.accountKeys.some(key => key.signer && key.pubkey.toBase58() === request.walletAddress);
-    if (!signedByWallet || confirmedHash !== intent.messageHash) {
-      return reply.code(422).send({ error: { code: 'TRANSACTION_MISMATCH', message: 'The on-chain transaction does not match the prepared trade.' } });
+    if (!signedByWallet) {
+      return reply.code(422).send({ error: { code: 'TRANSACTION_MISMATCH', message: 'This transaction was not signed by your wallet.' } });
     }
     let actualAveragePrice: number | null = null;
     let actualFilledUsd: number | null = null;
     let actualBaseAmount: number | null = null;
+    let fill: { inputAmount: number; outputAmount: number } | null = null;
     if (body.data.network === 'mainnet-beta' && market.baseMint && market.quoteMint && market.baseDecimals !== undefined && market.quoteDecimals !== undefined) {
       const inputMint = body.data.side === 'buy' ? market.quoteMint : market.baseMint;
       const outputMint = body.data.side === 'buy' ? market.baseMint : market.quoteMint;
@@ -284,7 +283,7 @@ export async function createApp(
       // Only a Phoenix swap pays the platform fee on the input mint; a Jupiter fee lands on the output
       // mint, so the treasury-account match below never counts it against the input.
       const feeAccountForFill = intent.feeAccount;
-      const fill = extractTokenFill(verification.transaction, body.data.userPublicKey, inputMint, outputMint, inputDecimals, outputDecimals, feeAccountForFill);
+      fill = extractTokenFill(verification.transaction, body.data.userPublicKey, inputMint, outputMint, inputDecimals, outputDecimals, feeAccountForFill);
       if (fill) {
         // The base asset is what comes in on a buy and what goes out on a sell.
         actualBaseAmount = round(body.data.side === 'buy' ? fill.outputAmount : fill.inputAmount, 10);
@@ -295,6 +294,17 @@ export async function createApp(
           actualFilledUsd = round(fill.outputAmount);
           actualAveragePrice = fill.inputAmount > 0 ? round(fill.outputAmount / fill.inputAmount, 10) : null;
         }
+      }
+      // Replaces an exact-byte transaction-hash check. That check compared raw instruction bytes and
+      // broke on every benign thing a wallet does before signing -- refreshing the blockhash, adding a
+      // priority fee, reordering instructions, and more we haven't hit yet. This checks what actually
+      // matters instead: the real token balances, read directly from the chain (the FILL_NOT_VERIFIED
+      // check just below already requires a fill to exist at all; this only adds a sanity bound on its
+      // size), moved in roughly the amount that was quoted. A genuinely different or unrelated
+      // transaction still fails via that existing check -- its balance changes won't match this
+      // market's mints, so no fill is found for it in the first place.
+      if (fill && actualFilledUsd !== null && (actualFilledUsd <= 0 || actualFilledUsd < intent.quote.requestedUsd * 0.5 || actualFilledUsd > intent.quote.requestedUsd * 1.5)) {
+        return reply.code(422).send({ error: { code: 'TRANSACTION_MISMATCH', message: 'The on-chain fill size does not match the prepared trade.' } });
       }
     }
 

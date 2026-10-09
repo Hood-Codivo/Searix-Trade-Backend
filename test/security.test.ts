@@ -117,30 +117,43 @@ describe('execution integrity', () => {
     const priorityFeeHash = await messageHash(withPriorityFee.serialize({ requireAllSignatures: false }).toString('base64'), connection);
     assert.equal(await messageHash(encoded, connection), priorityFeeHash);
   });
-  it('rejects unrelated successful transactions, accepts a matching fill, and makes concurrent replay idempotent', async () => {
+  it('rejects an unrelated fill size, a failed transaction, and a missing fill; accepts a matching fill and makes concurrent replay idempotent', async () => {
     const secret = process.env.EXECUTION_INTENT_SECRET;
     process.env.EXECUTION_INTENT_SECRET = 'test-only-secret-'.repeat(3);
     const wallet = Keypair.generate(); const walletAddress = wallet.publicKey.toBase58();
     const intents = new ExecutionIntents();
-    const ticket = intents.issue({ wallet: walletAddress, market, quote, messageHash: 'expected-hash' });
-    let hash = 'wrong-hash'; let success = true; let hasFill = true;
+    const ticket = intents.issue({ wallet: walletAddress, market, quote, messageHash: 'unused' });
+    // requestedUsd is 10 in `quote`; start with a wildly different real spend (1000 USDC) to prove a
+    // genuinely unrelated transaction -- same wallet, same mints, wrong size -- still gets rejected,
+    // now that the check is on real balances rather than an exact instruction-byte hash.
+    let quoteSpent = '1000000000'; let success = true; let hasFill = true;
     const entry = (mint: string, amount: string, accountIndex: number) => ({ owner: walletAddress, mint, accountIndex, uiTokenAmount: { amount, decimals: 6, uiAmount: Number(amount) / 1e6, uiAmountString: amount } });
-    const tx = { transaction: { message: { accountKeys: [{ pubkey: wallet.publicKey, signer: true, writable: true }], instructions: [] } }, meta: { err: null, fee: 5000, preBalances: [1e9], postBalances: [1e9 - 5000], preTokenBalances: [entry(quoteMint, '10000000', 1), entry(baseMint, '0', 2)], postTokenBalances: [entry(quoteMint, '0', 1), entry(baseMint, '5000000', 2)] } } as unknown as ParsedTransactionWithMeta;
+    const buildTx = (): ParsedTransactionWithMeta => {
+      const raw = {
+        transaction: { message: { accountKeys: [{ pubkey: wallet.publicKey, signer: true, writable: true }], instructions: [] } },
+        meta: {
+          err: null, fee: 5000, preBalances: [1e9], postBalances: [1e9 - 5000],
+          preTokenBalances: [entry(quoteMint, quoteSpent, 1), entry(baseMint, '0', 2)],
+          postTokenBalances: [entry(quoteMint, '0', 1), entry(baseMint, '5000000', 2)],
+        },
+      };
+      return raw as unknown as ParsedTransactionWithMeta;
+    };
     const receipts = new InMemoryReceiptRepository();
     const app = await createApp(provider(), receipts, previewFeePolicy, undefined, previewExecutionConfig, undefined, {
-      verifyTransactionSucceeded: async () => ({ success, slot: 1, transaction: hasFill ? tx : { ...tx, meta: { ...tx.meta!, postTokenBalances: [] } } }),
-      transactionMessageHash: async () => hash,
+      verifyTransactionSucceeded: async () => { const tx = buildTx(); return { success, slot: 1, transaction: hasFill ? tx : { ...tx, meta: { ...tx.meta!, postTokenBalances: [] } } }; },
+      transactionMessageHash: async () => 'unused',
     });
     try {
       const { headers } = await login(app, wallet);
       const payload = { executionIntent: ticket, signature: '1'.repeat(88), network: 'mainnet-beta', side: 'buy', amountUsd: 10, userPublicKey: walletAddress };
       const confirm = () => app.inject({ method: 'POST', url: `/v1/markets/${market.id}/execution-confirm`, headers, payload });
       assert.equal((await confirm()).json().error.code, 'TRANSACTION_MISMATCH');
-      hash = 'expected-hash'; success = false;
+      success = false;
       assert.equal((await confirm()).json().error.code, 'TRANSACTION_NOT_VERIFIED');
       success = true; hasFill = false;
       assert.equal((await confirm()).json().error.code, 'FILL_NOT_VERIFIED');
-      hasFill = true;
+      hasFill = true; quoteSpent = '10000000'; // matches requestedUsd: 10
       const responses = await Promise.all([confirm(), confirm()]);
       assert.ok(responses.every(response => response.statusCode === 201));
       assert.equal((await receipts.list()).length, 1);
