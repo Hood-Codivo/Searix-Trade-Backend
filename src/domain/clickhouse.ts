@@ -2,6 +2,8 @@ import { createClient, type ClickHouseClient } from '@clickhouse/client';
 
 let client: ClickHouseClient | null = null;
 let ready: Promise<void> | null = null;
+let retryAfter = 0;
+let lastErrorAt = -Infinity;
 
 export function isClickhouseConfigured(): boolean {
   return Boolean(process.env.CLICKHOUSE_URL?.trim());
@@ -45,14 +47,17 @@ async function ensureReady(): Promise<void> {
         ORDER BY (market_id, observed_at)
       `,
     });
-  })();
+  })().catch((error: unknown) => {
+    ready = null;
+    throw error;
+  });
   return ready;
 }
 
 // Fire-and-forget: a tick-storage failure must never break the real-time market update path that
 // calls this. Errors are swallowed after being surfaced once via console.error for visibility.
 export async function recordTick(marketId: string, price: number, observedAt = new Date()): Promise<void> {
-  if (!isClickhouseConfigured()) return;
+  if (!isClickhouseConfigured() || Date.now() < retryAfter) return;
   try {
     await ensureReady();
     const ch = getClient();
@@ -62,6 +67,11 @@ export async function recordTick(marketId: string, price: number, observedAt = n
       format: 'JSONEachRow',
     });
   } catch (error) {
-    console.error('ClickHouse tick persistence failed');
+    retryAfter = Date.now() + 30_000;
+    if (Date.now() - lastErrorAt >= 30_000) {
+      lastErrorAt = Date.now();
+      // Do not log connection details: URLs can contain credentials.
+      console.error('ClickHouse tick persistence failed; skipping persistence for 30s (ticks during this period are not stored)');
+    }
   }
 }

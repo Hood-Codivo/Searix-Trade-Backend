@@ -14,3 +14,5 @@ secrets/
 
 # Not part of the running app.
 pitch-deck/
+security-audit/
+SECURITY.md

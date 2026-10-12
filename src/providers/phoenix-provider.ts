@@ -53,6 +53,10 @@ export class PhoenixProvider implements MarketProvider {
   private readonly jupiter = new JupiterReferenceClient();
   private pollTimer?: NodeJS.Timeout;
   private statsTimer?: NodeJS.Timeout;
+  private running = false;
+  private polling = false;
+  private failures = 0;
+  private nextPollAt = 0;
   status: 'idle' | 'connected' | 'degraded' = 'idle';
 
   constructor(private readonly config: PhoenixProviderConfig) {
@@ -60,9 +64,22 @@ export class PhoenixProvider implements MarketProvider {
   }
 
   async start() {
-    const marketPubkeys = this.config.marketAddresses.map((address) => new PublicKey(address));
-    this.client = await Client.createWithMarketAddresses(this.connection, marketPubkeys);
+    if (this.running) return;
+    // Validate configuration before entering the transient-error recovery loop.
+    this.config.marketAddresses.forEach((address) => new PublicKey(address));
+    this.running = true;
+    await this.pollAll();
+    if (!this.running) return;
+    this.pollTimer = setInterval(() => void this.pollAll(), this.config.pollMs ?? 15_000);
+    void this.refreshStats();
+    this.statsTimer = setInterval(() => void this.refreshStats(), 30_000);
+  }
 
+  private async initialize() {
+    const marketPubkeys = this.config.marketAddresses.map((address) => new PublicKey(address));
+    const client = await Client.createWithMarketAddresses(this.connection, marketPubkeys);
+    if (!this.running) return;
+    this.client = client;
     for (const address of this.config.marketAddresses) {
       this.applySnapshot(address);
       const pubkey = new PublicKey(address);
@@ -79,21 +96,18 @@ export class PhoenixProvider implements MarketProvider {
       this.subscriptionIds.push(subscriptionId);
     }
 
-    this.status = 'connected';
-    // Backstop in case a websocket update is silently dropped; keeps `status` honest even then.
-    this.pollTimer = setInterval(() => this.pollAll(), this.config.pollMs ?? 15_000);
-    // Real 24h change/volume come from a separate, lower-frequency batched Jupiter call (not the
-    // account-change/poll path above, which only ever sees live book state, not historical stats).
-    void this.refreshStats();
-    this.statsTimer = setInterval(() => void this.refreshStats(), 30_000);
   }
 
   async stop() {
-    for (const id of this.subscriptionIds) await this.connection.removeAccountChangeListener(id);
-    this.subscriptionIds.length = 0;
+    this.running = false;
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.status = 'idle';
+    const ids = this.subscriptionIds.splice(0);
+    await Promise.allSettled(ids.map((id) => this.connection.removeAccountChangeListener(id)));
+    this.client = undefined;
+    this.failures = 0;
+    this.nextPollAt = 0;
   }
 
   list() {
@@ -180,13 +194,27 @@ export class PhoenixProvider implements MarketProvider {
   }
 
   private async pollAll() {
-    if (!this.client) return;
+    if (!this.running || this.polling || Date.now() < this.nextPollAt) return;
+    this.polling = true;
     try {
-      await this.client.refreshAllMarkets();
-      for (const address of this.config.marketAddresses) this.applySnapshot(address);
+      if (!this.client) await this.initialize();
+      else {
+        await this.client.refreshAllMarkets();
+        if (!this.running) return;
+        for (const address of this.config.marketAddresses) this.applySnapshot(address);
+      }
+      if (!this.running) return;
+      this.failures = 0;
+      this.nextPollAt = 0;
       this.status = 'connected';
     } catch {
+      if (!this.running) return;
       this.status = 'degraded';
+      const delay = Math.min(300_000, (this.config.pollMs ?? 15_000) * 2 ** Math.min(++this.failures, 5));
+      this.nextPollAt = Date.now() + delay;
+      console.error(`Phoenix market refresh failed; retrying in at least ${delay}ms`);
+    } finally {
+      this.polling = false;
     }
   }
 
